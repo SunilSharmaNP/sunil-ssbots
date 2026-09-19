@@ -8,6 +8,24 @@
     },
     "api/diskwala.js": {
       "maxDuration": 60
+    },
+    "api/hubcloud.js": {
+      "maxDuration": 60
+    },
+    "api/gdflix.js": {
+      "maxDuration": 60
+    },
+    "api/hubdrive.js": {
+      "maxDuration": 60
+    },
+    "api/multicloud.js": {
+      "maxDuration": 60
+    },
+    "api/gofile.js": {
+      "maxDuration": 60
+    },
+    "api/extract.js": {
+      "maxDuration": 60
     }
   }
 }
