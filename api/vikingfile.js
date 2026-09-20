@@ -15,12 +15,11 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // =========================================================================
-// 🔑 HARDCODED VIKINGFILE USER ACCOUNT HASH ID
-// Agar aap URL ya environment variable me hash pass nahi karna chahte,
-// toh seedha yahan single quotes ke andar apni Free/Premium Account Hash ID paste karein:
-// Example: const HARDCODED_USER_HASH = 'y48bfd92a01ce...';
+// 🔑 HARDCODED VIKINGFILE USER ACCOUNT HASH ID & SESSION COOKIES
 // =========================================================================
-const HARDCODED_USER_HASH = 'PfTu2DmQ9a'; 
+const HARDCODED_USER_HASH = 'PfTu2DmQ9a';
+const HARDCODED_USER_COOKIE =
+  'PHPSESSID=b593b1bd1bf73e9a5e7315443fa29ee2; REMEMBERME=App.Entity.User%3AUGZUdTJEbVE5YQ~~%3A2105248431%3A1-l63uFflY_UGFBzxhrqxz_cKEstk_hXMysPezyZe3s~XnFVyn6olFyy4G9EnKrTGKIY6kIb6UcHBuxZtrRmvv8~';
 // =========================================================================
 
 function formatBytes(bytes, decimals = 2) {
@@ -150,7 +149,6 @@ async function loginWithUserHash(userHash) {
  */
 async function requestDownloadEndpoint(fileId, cookieHeader = '', turnstileToken = '', userHash = '') {
   const targetEndpoints = [
-    `https://vik1ngfile.site/f/${fileId}`,
     `https://vikingfile.com/f/${fileId}`,
   ];
 
@@ -221,7 +219,12 @@ async function extractVikingfileSingle(targetUrl, options = {}) {
     '';
 
   const turnstileToken = options.token || options.turnstile || options['cf-turnstile-response'] || '';
-  const providedCookie = options.cookie || options.session || '';
+  const providedCookie =
+    options.cookie ||
+    options.session ||
+    HARDCODED_USER_COOKIE ||
+    process.env.VIKINGFILE_COOKIE ||
+    '';
 
   // 1. Fetch official file metadata
   const checkInfo = await checkVikingFile(fileId);
