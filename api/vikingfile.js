@@ -20,7 +20,7 @@ const USER_AGENT =
 // toh seedha yahan single quotes ke andar apni Free/Premium Account Hash ID paste karein:
 // Example: const HARDCODED_USER_HASH = 'y48bfd92a01ce...';
 // =========================================================================
-const HARDCODED_USER_HASH = ''; 
+const HARDCODED_USER_HASH = 'PfTu2DmQ9a'; 
 // =========================================================================
 
 function formatBytes(bytes, decimals = 2) {
