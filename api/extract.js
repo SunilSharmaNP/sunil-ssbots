@@ -22,6 +22,7 @@ const { extractGdflixSingle } = require("./gdflix.js");
 const { extractHubdriveSingle } = require("./hubdrive.js");
 const { extractMulticloudSingle } = require("./multicloud.js");
 const { extractGofileSingle } = require("./gofile.js");
+const { extractVikingfileSingle } = require("./vikingfile.js");
 
 function sendJson(res, status, data) {
   res.setHeader("Content-Type", "application/json");
@@ -41,6 +42,7 @@ function detectService(urlStr) {
   if (str.includes("multicloudlinks") || str.includes("multidownload.rent")) return "multicloud";
   if (str.includes("gofile.io") || str.includes("gofile.me")) return "gofile";
   if (str.includes("pixeldrain.com") || str.includes("pixeldra.in")) return "pixeldrain";
+  if (str.includes("vikingfile.com") || str.includes("vik1ngfile.site") || str.includes("vikingfile")) return "vikingfile";
   if (str.includes("diskwala.com") || str.includes("thediskwala.com")) return "diskwala";
   if (
     str.includes("terabox") ||
@@ -59,11 +61,15 @@ module.exports = async function handler(req, res) {
   if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   const url = req.method === "GET" ? req.query.url : req.body?.url;
+  const user = req.method === "GET" ? req.query.user || req.query.hash : req.body?.user || req.body?.hash;
+  const token = req.method === "GET" ? req.query.token : req.body?.token;
+  const cookie = req.method === "GET" ? req.query.cookie : req.body?.cookie;
+
   if (!url) {
     return sendJson(res, 400, {
       success: false,
       error: "URL parameter is required",
-      supportedServices: ["hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain"],
+      supportedServices: ["hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain", "vikingfile"],
     });
   }
 
@@ -98,6 +104,10 @@ module.exports = async function handler(req, res) {
         result = await extractGofileSingle(url);
         break;
 
+      case "vikingfile":
+        result = await extractVikingfileSingle(url, { user, token, cookie });
+        break;
+
       case "pixeldrain": {
         const parts = url.split("/u/")[1]?.split(/[\?\/]/)[0] || url.split("/").pop();
         const dl = `https://pixeldrain.com/api/file/${parts}?download`;
@@ -123,7 +133,7 @@ module.exports = async function handler(req, res) {
           success: false,
           error: `Unsupported service or unrecognized URL: ${url}`,
           detectedService: service,
-          supportedServices: ["hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain"],
+          supportedServices: ["hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain", "vikingfile"],
         });
     }
 
