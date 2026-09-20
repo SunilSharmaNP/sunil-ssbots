@@ -14,6 +14,15 @@
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+// =========================================================================
+// 🔑 HARDCODED VIKINGFILE USER ACCOUNT HASH ID
+// Agar aap URL ya environment variable me hash pass nahi karna chahte,
+// toh seedha yahan single quotes ke andar apni Free/Premium Account Hash ID paste karein:
+// Example: const HARDCODED_USER_HASH = 'y48bfd92a01ce...';
+// =========================================================================
+const HARDCODED_USER_HASH = ''; 
+// =========================================================================
+
 function formatBytes(bytes, decimals = 2) {
   if (!bytes || bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -205,6 +214,7 @@ async function extractVikingfileSingle(targetUrl, options = {}) {
   const userHash =
     options.user ||
     options.hash ||
+    HARDCODED_USER_HASH ||
     process.env.VIKINGFILE_USER_HASH ||
     process.env.VIKINGFILE_HASH ||
     process.env.VIKINGFILE_USER ||
