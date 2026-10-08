@@ -1,14 +1,18 @@
 /**
  * YouTube All-Quality Direct Downloader (DDL) API
- * Powered by YouTubeToolkit (https://youtubetoolkit.com/tools/video-downloader-1080p)
+ * High-Speed Ad-Free Stream & Format Extractor
  * ---------------------------------------------------------------------------------
  * Extracts authentic, direct download links (DDL) for 1080p Full HD, 720p, 480p,
- * 360p, 4K, and MP3 audio streams without spam or fake ad redirects.
+ * 360p, 4K, and MP3 / M4A audio streams without spam, ad popups, or fake redirects.
  *
  * Usage:
  *   GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=1080
  *   POST /api/youtube   body: { "url": "https://youtu.be/VIDEO_ID", "quality": "1080" }
  */
+
+const { execFile } = require("child_process");
+const path = require("path");
+const fs = require("fs");
 
 const YOUTUBE_HOSTS = new Set([
   "www.youtube.com",
@@ -28,6 +32,10 @@ function getVideoId(input) {
   try {
     url = new URL(input.trim());
   } catch {
+    // If just an ID was passed
+    if (/^[A-Za-z0-9_-]{11}$/.test(input.trim())) {
+      return input.trim();
+    }
     return null;
   }
 
@@ -46,7 +54,9 @@ function getVideoId(input) {
 
   const pathParts = url.pathname.split("/").filter(Boolean);
   const pathId =
-    pathParts[0] === "shorts" || pathParts[0] === "embed" ? pathParts[1] : null;
+    pathParts[0] === "shorts" || pathParts[0] === "embed" || pathParts[0] === "v"
+      ? pathParts[1]
+      : null;
 
   return pathId && /^[A-Za-z0-9_-]{6,20}$/.test(pathId) ? pathId : null;
 }
@@ -79,103 +89,76 @@ function sendJson(res, status, data) {
   return res.status(status).json(data);
 }
 
-/**
- * Fetches fresh CSRF token and session cookies from YouTubeToolkit
- */
-async function getYouTubeToolkitSession() {
-  const pageRes = await fetch("https://youtubetoolkit.com/tools/video-downloader-1080p", {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-    signal: AbortSignal.timeout(10000),
-  });
+function formatDuration(sec) {
+  if (!sec || isNaN(sec)) return "—";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
 
-  if (!pageRes.ok) {
-    throw new Error(`YouTubeToolkit unreachable (HTTP ${pageRes.status})`);
-  }
-
-  const html = await pageRes.text();
-  const rawCookies = pageRes.headers.getSetCookie
-    ? pageRes.headers.getSetCookie()
-    : [pageRes.headers.get("set-cookie")];
-  const cookieHeader = (rawCookies || [])
-    .map((c) => (c ? c.split(";")[0] : ""))
-    .filter(Boolean)
-    .join("; ");
-
-  const match = html.match(/id="ytk-direct-downloader-config">(\{.*?\})<\/script>/);
-  if (!match) {
-    throw new Error("Could not parse YouTubeToolkit configuration");
-  }
-
-  const config = JSON.parse(match[1]);
-  return {
-    csrf: config.csrf,
-    cookies: cookieHeader,
-    routes: config.routes,
-    tool: config.tool,
-  };
+function formatBytes(bytes) {
+  if (!bytes || isNaN(bytes)) return null;
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 /**
- * Step 1: Analyze YouTube video metadata & available options
+ * Extracts YouTube video information and authentic direct stream URLs
  */
-async function analyzeYouTubeVideo(ytUrl, session) {
-  const analyzeRes = await fetch(session.routes.analyze, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-TOKEN": session.csrf,
-      Cookie: session.cookies,
-      "User-Agent": USER_AGENT,
-      Referer: "https://youtubetoolkit.com/tools/video-downloader-1080p",
-      Origin: "https://youtubetoolkit.com",
-    },
-    body: JSON.stringify({
-      url: ytUrl,
-      download_api: session.tool?.download_api || "video_fast",
-    }),
-    signal: AbortSignal.timeout(12000),
+function extractWithYtDlp(ytUrl) {
+  return new Promise((resolve, reject) => {
+    // Resolve yt-dlp binary path
+    const candidatePaths = [
+      path.join(process.cwd(), "bin", "yt-dlp"),
+      "/tmp/yt-dlp",
+      "/usr/local/bin/yt-dlp",
+      "/usr/bin/yt-dlp",
+    ];
+
+    let binPath = candidatePaths.find((p) => fs.existsSync(p));
+    if (!binPath) {
+      binPath = "yt-dlp";
+    }
+
+    const nodePath = fs.existsSync("/usr/local/bin/node")
+      ? "/usr/local/bin/node"
+      : process.execPath;
+
+    const args = [
+      "--js-runtimes",
+      `node:${nodePath}`,
+      "--dump-single-json",
+      "--no-warnings",
+      "--no-playlist",
+      ytUrl,
+    ];
+
+    execFile(
+      binPath,
+      args,
+      { maxBuffer: 15 * 1024 * 1024, timeout: 30000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return reject(
+            new Error(
+              `Extraction error: ${stderr || err.message || "Failed to execute extractor"}`
+            )
+          );
+        }
+
+        try {
+          const data = JSON.parse(stdout);
+          resolve(data);
+        } catch (parseErr) {
+          reject(new Error("Failed to parse extractor output JSON"));
+        }
+      }
+    );
   });
-
-  const data = await analyzeRes.json();
-  if (!data.success || !data.data) {
-    throw new Error(data.message || "Failed to analyze video options from YouTube");
-  }
-
-  return data.data;
 }
 
 /**
- * Step 2: Resolve Direct Download Link (DDL) for a specific quality
- */
-async function resolveYouTubeDDL(meta, mode, session) {
-  const resolveRes = await fetch(session.routes.resolve, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-TOKEN": session.csrf,
-      Cookie: session.cookies,
-      "User-Agent": USER_AGENT,
-      Referer: "https://youtubetoolkit.com/tools/video-downloader-1080p",
-      Origin: "https://youtubetoolkit.com",
-    },
-    body: JSON.stringify({
-      video_id: meta.video_id,
-      download_mode: mode,
-      download_api: session.tool?.download_api || "video_fast",
-      title: meta.title || "",
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  const resData = await resolveRes.json();
-  return resData;
-}
-
-/**
- * Fallback oEmbed metadata if toolkit is temporarily down
+ * Fallback oEmbed metadata if needed
  */
 async function getYouTubeOEmbed(videoId) {
   const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
@@ -186,7 +169,8 @@ async function getYouTubeOEmbed(videoId) {
       return {
         title: data.title || "YouTube Video",
         author: data.author_name || "Creator",
-        thumbnail: data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+        thumbnail:
+          data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
       };
     }
   } catch {
@@ -226,152 +210,185 @@ module.exports = async function handler(req, res) {
   const startTime = Date.now();
 
   try {
-    // 1. Fetch Session from YouTubeToolkit
-    let session;
-    let meta;
+    // Run direct ad-free extraction engine
+    const info = await extractWithYtDlp(ytUrl);
 
-    try {
-      session = await getYouTubeToolkitSession();
-      meta = await analyzeYouTubeVideo(ytUrl, session);
-    } catch (analysisErr) {
-      // Fallback metadata if analyze fails
-      const oembed = await getYouTubeOEmbed(videoId);
-      meta = {
-        video_id: videoId,
-        title: oembed.title,
-        channel_title: oembed.author,
-        thumbnail: oembed.thumbnail,
-        duration: "—",
-        watch_url: ytUrl,
-        embed_url: `https://www.youtube.com/embed/${videoId}`,
-        video_options: [
-          { mode: "video:1080", label: "Video 1080p (Full HD)" },
-          { mode: "video:720", label: "Video 720p (HD)" },
-          { mode: "video:480", label: "Video 480p (SD)" },
-          { mode: "video:360", label: "Video 360p" },
-        ],
-        audio_options: [
-          { mode: "audio:320", label: "MP3 320 kbps" },
-          { mode: "audio:192", label: "MP3 192 kbps" },
-        ],
-      };
-    }
+    const formats = info.formats || [];
 
-    // 2. Map requested mode
-    let targetMode = "video:1080";
-    if (requestedQuality === "720") targetMode = "video:720";
-    else if (requestedQuality === "480") targetMode = "video:480";
-    else if (requestedQuality === "360") targetMode = "video:360";
-    else if (requestedQuality === "1440" || requestedQuality === "2k") targetMode = "video:1440";
-    else if (requestedQuality === "4k" || requestedQuality === "2160") targetMode = "video:4k";
-    else if (requestedQuality === "mp3" || requestedQuality.includes("audio")) targetMode = "audio:320";
-    else if (requestedQuality.startsWith("video:") || requestedQuality.startsWith("audio:")) {
-      targetMode = requestedQuality;
-    }
+    // Filter useful formats (progressive video+audio and separate high-res streams)
+    const processedFormats = [];
+    const downloadLinks = [];
 
-    // 3. Attempt direct DDL resolution via YouTubeToolkit
-    let directDownloadUrl = null;
-    let resolvedQuality = targetMode.replace("video:", "").replace("audio:", "");
-    let resolveError = null;
+    // 1. Progressive streams (Format 18 / 22 has video + audio in one file, ready for instant play/download)
+    const progressiveFormats = formats.filter(
+      (f) => f.vcodec !== "none" && f.acodec !== "none" && f.url
+    );
 
-    if (session) {
-      try {
-        const resolveData = await resolveYouTubeDDL(meta, targetMode, session);
-        if (resolveData.success && resolveData.data?.download_url) {
-          directDownloadUrl = resolveData.data.download_url;
-        } else if (resolveData.limit_reached) {
-          resolveError = resolveData.message || "Daily free resolution limit reached on server IP.";
-        } else {
-          resolveError = resolveData.message || "Could not resolve direct link for requested mode.";
-        }
-      } catch (err) {
-        resolveError = err.message;
+    // 2. Separate video streams (1080p, 720p, etc.)
+    const videoStreams = formats.filter(
+      (f) => f.vcodec !== "none" && f.url && f.height
+    );
+
+    // 3. Audio only streams (m4a, opus, mp3)
+    const audioStreams = formats.filter(
+      (f) => f.vcodec === "none" && f.acodec !== "none" && f.url
+    );
+
+    // Sort video streams by height descending
+    videoStreams.sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    // Best progressive stream (usually format 18 at 360p or format 22 at 720p)
+    const bestProgressive =
+      progressiveFormats.find((f) => f.height === 720) ||
+      progressiveFormats.find((f) => f.height === 360) ||
+      progressiveFormats[0];
+
+    // Find requested quality format
+    let targetFormat = null;
+    if (requestedQuality === "mp3" || requestedQuality.includes("audio")) {
+      targetFormat =
+        audioStreams.find((f) => f.ext === "m4a") ||
+        audioStreams[0] ||
+        bestProgressive;
+    } else {
+      const targetHeight = parseInt(requestedQuality, 10);
+      if (!isNaN(targetHeight)) {
+        targetFormat =
+          videoStreams.find((f) => f.height === targetHeight) ||
+          progressiveFormats.find((f) => f.height === targetHeight);
       }
     }
 
-    // 4. Construct response with verified download buttons & options
-    const downloadLinks = [];
+    // Default primary direct download URL:
+    // Prefer targetFormat URL, or bestProgressive URL
+    const directDownloadUrl =
+      targetFormat?.url || bestProgressive?.url || videoStreams[0]?.url || null;
 
-    // If direct link was resolved
-    if (directDownloadUrl) {
+    // Build user-friendly downloadLinks cards
+    if (bestProgressive?.url) {
       downloadLinks.push({
-        format: resolvedQuality,
-        label: `Direct MP4 ${resolvedQuality}p (Full Download)`,
-        type: targetMode.startsWith("audio") ? "audio" : "video",
-        quality: `${resolvedQuality}p`,
-        downloadUrl: directDownloadUrl,
+        format: `${bestProgressive.height || 360}p`,
+        label: `⚡ Instant MP4 (${bestProgressive.height || 360}p Video + Audio - No Ads)`,
+        type: "progressive",
+        quality: `${bestProgressive.height || 360}p`,
+        filesize: formatBytes(bestProgressive.filesize || bestProgressive.filesize_approx),
+        url: bestProgressive.url,
+        downloadUrl: bestProgressive.url,
         verified: true,
       });
     }
 
-    // Add quality selector options so frontend and Telegram bot can call each resolution
-    const videoOptions = meta.video_options || [];
-    for (const opt of videoOptions) {
-      const q = opt.mode.replace("video:", "");
-      downloadLinks.push({
-        format: q,
-        label: `${opt.label} — Direct DDL`,
-        type: "video",
-        quality: `${q}p`,
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${q}`,
-        downloadUrl: directDownloadUrl && q === resolvedQuality ? directDownloadUrl : undefined,
-        verified: true,
-      });
+    // Add standard resolutions (1080p, 720p, 480p, 360p)
+    const distinctHeights = [1080, 720, 480, 360];
+    for (const h of distinctHeights) {
+      const f = videoStreams.find((v) => v.height === h);
+      if (f && f.url) {
+        downloadLinks.push({
+          format: `${h}p`,
+          label: `HD ${h}p Direct Stream (${f.ext || "mp4"})`,
+          type: "video",
+          quality: `${h}p`,
+          filesize: formatBytes(f.filesize || f.filesize_approx),
+          url: f.url,
+          downloadUrl: f.url,
+          verified: true,
+        });
+      }
     }
 
-    const audioOptions = meta.audio_options || [];
-    for (const opt of audioOptions) {
-      const q = opt.mode.replace("audio:", "");
+    // Add audio option
+    const bestAudio =
+      audioStreams.find((a) => a.ext === "m4a") || audioStreams[0];
+    if (bestAudio?.url) {
       downloadLinks.push({
-        format: `mp3-${q}`,
-        label: `${opt.label} — High Quality Audio`,
+        format: "audio",
+        label: `🎵 High-Quality Audio (${bestAudio.ext || "m4a"})`,
         type: "audio",
-        quality: `${q}kbps`,
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=audio:${q}`,
+        quality: `${Math.round(bestAudio.abr || 128)}kbps`,
+        filesize: formatBytes(bestAudio.filesize || bestAudio.filesize_approx),
+        url: bestAudio.url,
+        downloadUrl: bestAudio.url,
         verified: true,
       });
     }
 
-    // One-click direct web downloader link that runs in user's browser with their own IP
-    const browserAutoDownloadUrl = `https://youtubetoolkit.com/tools/video-downloader-1080p?url=${encodeURIComponent(ytUrl)}&download=1`;
+    // Build format table list
+    for (const f of formats) {
+      if (!f.url) continue;
+      const isVideo = f.vcodec !== "none";
+      const isAudio = f.acodec !== "none";
+      processedFormats.push({
+        format_id: f.format_id,
+        resolution: f.resolution || (f.height ? `${f.height}p` : "audio only"),
+        ext: f.ext,
+        filesize: formatBytes(f.filesize || f.filesize_approx) || "Auto",
+        vcodec: f.vcodec !== "none" ? f.vcodec : undefined,
+        acodec: f.acodec !== "none" ? f.acodec : undefined,
+        url: f.url,
+      });
+    }
 
     const responsePayload = {
       success: true,
       service: "youtube",
-      provider: "youtubetoolkit.com",
+      provider: "direct_stream_engine",
       videoId,
-      title: meta.title || "YouTube Video",
-      channel: meta.channel_title || "YouTube",
-      authorName: meta.channel_title || "YouTube",
-      thumbnailUrl: meta.thumbnail || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-      duration: meta.duration || "—",
+      title: info.title || "YouTube Video",
+      channel: info.uploader || info.channel || "YouTube Creator",
+      authorName: info.uploader || info.channel || "YouTube Creator",
+      thumbnailUrl:
+        info.thumbnail || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+      duration: info.duration || 0,
+      durationStr: formatDuration(info.duration),
       sourceUrl: ytUrl,
       watchUrl: ytUrl,
       embedUrl: `https://www.youtube.com/embed/${videoId}`,
-      downloadUrl: directDownloadUrl || browserAutoDownloadUrl,
-      browserDownloadUrl: browserAutoDownloadUrl,
-      resolvedMode: targetMode,
+      directDownloadUrl: directDownloadUrl,
+      downloadUrl: directDownloadUrl,
       downloadLinks,
+      formats: processedFormats.slice(0, 20),
       mirrors: [
         {
-          name: "⚡ 1-Click Browser HD Direct Download (No Daily Limit)",
-          type: "browser_direct",
-          url: browserAutoDownloadUrl,
+          name: "🌐 Y2Mate Web Mirror (External Browser Portal)",
+          type: "web_mirror",
+          url: `https://v38.www-y2mate.com/`,
+        },
+        {
+          name: "⚡ 1-Click Direct Stream (0 Ads / Pure CDN)",
+          type: "direct_stream",
+          url: directDownloadUrl,
         },
       ],
-      notice: directDownloadUrl
-        ? "Direct file stream generated successfully."
-        : "Direct server resolution limit reached. Use browserDownloadUrl for instant 1080p download without server limits.",
+      notice: "Direct GoogleVideo CDN stream extracted successfully without ads.",
       durationMs: Date.now() - startTime,
     };
 
     return sendJson(res, 200, responsePayload);
   } catch (err) {
-    console.error("YouTube extractor error:", err);
-    return sendJson(res, 500, {
-      success: false,
+    console.error("YouTube direct extraction error:", err);
+
+    // Fallback to oembed and helpful notice if video is restricted or deleted
+    const oembed = await getYouTubeOEmbed(videoId);
+    return sendJson(res, 200, {
+      success: true,
       service: "youtube",
-      error: err.message || "Failed to process YouTube video formats",
+      provider: "fallback_portal",
+      videoId,
+      title: oembed.title,
+      channel: oembed.author,
+      thumbnailUrl: oembed.thumbnail,
+      sourceUrl: ytUrl,
+      downloadUrl: `https://v38.www-y2mate.com/`,
+      mirrors: [
+        {
+          name: "🌐 Y2Mate Portal Mirror",
+          type: "web_mirror",
+          url: `https://v38.www-y2mate.com/`,
+        },
+      ],
+      downloadLinks: [],
+      errorNotice: err.message,
+      notice: "Could not extract direct stream URL (video might be geo-restricted or age-restricted). Use web mirror portal.",
       durationMs: Date.now() - startTime,
     });
   }
