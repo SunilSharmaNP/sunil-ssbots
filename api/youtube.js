@@ -1,14 +1,15 @@
 /**
- * YouTube All-Quality Direct Downloader (DDL) API
- * Powered by YouTubeToolkit (https://youtubetoolkit.com/tools/video-downloader-1080p)
- * ---------------------------------------------------------------------------------
- * Extracts authentic, direct download links (DDL) for 1080p Full HD, 720p, 480p,
- * 360p, 4K, and MP3 audio streams without spam or fake ad redirects.
+ * YouTube All-Quality Downloader — Fixed & Optimized Savenow Engine
+ * ------------------------------------------------------------------
+ * Fixes the 15-format concurrent flood issue that was causing rate-limits,
+ * timeouts, and ad-redirection on p.savenow.to.
  *
  * Usage:
- *   GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=1080
+ *   GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=720
  *   POST /api/youtube   body: { "url": "https://youtu.be/VIDEO_ID", "quality": "1080" }
  */
+
+// ─── YouTube URL Parsing ──────────────────────────────────────────────────────
 
 const YOUTUBE_HOSTS = new Set([
   "www.youtube.com",
@@ -17,9 +18,6 @@ const YOUTUBE_HOSTS = new Set([
   "youtu.be",
   "music.youtube.com",
 ]);
-
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 function getVideoId(input) {
   if (typeof input !== "string" || input.trim().length === 0) return null;
@@ -68,7 +66,10 @@ function getRequestedUrl(req) {
 
 function getRequestedQuality(req) {
   const q = req.method === "GET" ? req.query?.quality : req.body?.quality;
-  return q ? String(q).trim().toLowerCase() : "1080";
+  if (!q) return "720"; // default to fast 720p HD
+  const s = String(q).toLowerCase().replace("video:", "").replace("audio:", "");
+  if (s === "mp3" || s.includes("audio")) return "mp3";
+  return s;
 }
 
 function sendJson(res, status, data) {
@@ -79,134 +80,185 @@ function sendJson(res, status, data) {
   return res.status(status).json(data);
 }
 
-/**
- * Fetches fresh CSRF token and session cookies from YouTubeToolkit
- */
-async function getYouTubeToolkitSession() {
-  const pageRes = await fetch("https://youtubetoolkit.com/tools/video-downloader-1080p", {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-    signal: AbortSignal.timeout(10000),
-  });
+// ─── Savenow.to API Configuration ────────────────────────────────────────────
 
-  if (!pageRes.ok) {
-    throw new Error(`YouTubeToolkit unreachable (HTTP ${pageRes.status})`);
-  }
+const SAVENOW_API_KEY  = "dfcb6d76f2f6a9894gjkege8a4ab232222";
+const SAVENOW_BASE     = "https://p.savenow.to";
+const POLL_INTERVAL_MS = 1500;          // poll every 1.5s
+const POLL_MAX_TRIES   = 20;            // max ~30s
+const REQUEST_TIMEOUT  = 12000;
 
-  const html = await pageRes.text();
-  const rawCookies = pageRes.headers.getSetCookie
-    ? pageRes.headers.getSetCookie()
-    : [pageRes.headers.get("set-cookie")];
-  const cookieHeader = (rawCookies || [])
-    .map((c) => (c ? c.split(";")[0] : ""))
-    .filter(Boolean)
-    .join("; ");
+// In-memory cache to prevent duplicate conversions and serve instantly
+const cache = new Map();
 
-  const match = html.match(/id="ytk-direct-downloader-config">(\{.*?\})<\/script>/);
-  if (!match) {
-    throw new Error("Could not parse YouTubeToolkit configuration");
-  }
+/** All supported formats */
+const ALL_FORMATS = [
+  { id: "1080", label: "MP4 1080p (Full HD)", type: "video" },
+  { id: "720",  label: "MP4 720p (HD)",       type: "video" },
+  { id: "480",  label: "MP4 480p (SD)",       type: "video" },
+  { id: "360",  label: "MP4 360p (Fast)",     type: "video" },
+  { id: "1440", label: "MP4 1440p (2K)",      type: "video" },
+  { id: "4k",   label: "WEBM 4K (Ultra HD)",  type: "video" },
+  { id: "mp3",  label: "MP3 Audio (High)",    type: "audio" },
+  { id: "m4a",  label: "M4A Audio (AAC)",     type: "audio" },
+  { id: "flac", label: "FLAC Audio (Lossless)", type: "audio" },
+];
 
-  const config = JSON.parse(match[1]);
-  return {
-    csrf: config.csrf,
-    cookies: cookieHeader,
-    routes: config.routes,
-    tool: config.tool,
-  };
-}
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+  "Referer":    "https://y2mate.yt/",
+  "Origin":     "https://y2mate.yt",
+};
 
-/**
- * Step 1: Analyze YouTube video metadata & available options
- */
-async function analyzeYouTubeVideo(ytUrl, session) {
-  const analyzeRes = await fetch(session.routes.analyze, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-TOKEN": session.csrf,
-      Cookie: session.cookies,
-      "User-Agent": USER_AGENT,
-      Referer: "https://youtubetoolkit.com/tools/video-downloader-1080p",
-      Origin: "https://youtubetoolkit.com",
-    },
-    body: JSON.stringify({
-      url: ytUrl,
-      download_api: session.tool?.download_api || "video_fast",
-    }),
-    signal: AbortSignal.timeout(12000),
-  });
-
-  const data = await analyzeRes.json();
-  if (!data.success || !data.data) {
-    throw new Error(data.message || "Failed to analyze video options from YouTube");
-  }
-
-  return data.data;
-}
-
-/**
- * Step 2: Resolve Direct Download Link (DDL) for a specific quality
- */
-async function resolveYouTubeDDL(meta, mode, session) {
-  const resolveRes = await fetch(session.routes.resolve, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-TOKEN": session.csrf,
-      Cookie: session.cookies,
-      "User-Agent": USER_AGENT,
-      Referer: "https://youtubetoolkit.com/tools/video-downloader-1080p",
-      Origin: "https://youtubetoolkit.com",
-    },
-    body: JSON.stringify({
-      video_id: meta.video_id,
-      download_mode: mode,
-      download_api: session.tool?.download_api || "video_fast",
-      title: meta.title || "",
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-
-  const resData = await resolveRes.json();
-  return resData;
-}
-
-/**
- * Fallback oEmbed metadata if toolkit is temporarily down
- */
-async function getYouTubeOEmbed(videoId) {
-  const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+async function fetchJSON(url, timeoutMs = REQUEST_TIMEOUT) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (res.ok) {
-      const data = await res.json();
+    const res = await fetch(url, { headers: HEADERS, signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Step 1: Start a download job for one format ───────────────────────────────
+
+async function startDownload(ytUrl, format) {
+  const apiUrl =
+    `${SAVENOW_BASE}/api/v2/download` +
+    `?format=${encodeURIComponent(format)}` +
+    `&url=${encodeURIComponent(ytUrl)}` +
+    `&apikey=${SAVENOW_API_KEY}`;
+
+  const data = await fetchJSON(apiUrl);
+
+  if (!data.success || !data.id || !data.progress_url) {
+    throw new Error(data.message || "No job ID returned by converter");
+  }
+  return data;
+}
+
+// ─── Step 2: Poll progress until finished ────────────────────────────────────
+
+async function pollUntilDone(progressUrl) {
+  for (let attempt = 0; attempt < POLL_MAX_TRIES; attempt++) {
+    await sleep(POLL_INTERVAL_MS);
+    let data;
+    try {
+      data = await fetchJSON(progressUrl);
+    } catch {
+      continue;
+    }
+
+    const status = (data.text || "").toLowerCase();
+
+    // Done with valid download URL
+    if (data.success === 1 && data.download_url) {
+      return { ok: true, downloadUrl: data.download_url, data };
+    }
+
+    // Explicit failure
+    if (status === "error" || status === "failed") {
+      return { ok: false, reason: data.message || "conversion error" };
+    }
+  }
+
+  return { ok: false, reason: "timed out waiting for converter" };
+}
+
+// ─── Step 3: Process one format end-to-end ───────────────────────────────────
+
+async function processFormat(ytUrl, formatId, label = "", type = "video") {
+  const cacheKey = `${ytUrl}_${formatId}`;
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
+  }
+
+  try {
+    const job = await startDownload(ytUrl, formatId);
+    const result = await pollUntilDone(job.progress_url);
+
+    if (!result.ok) {
       return {
-        title: data.title || "YouTube Video",
-        author: data.author_name || "Creator",
-        thumbnail: data.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+        format: formatId,
+        label: label || `Format ${formatId}`,
+        type,
+        status: "unavailable",
+        reason: result.reason,
       };
     }
-  } catch {
-    // ignore
+
+    const payload = {
+      format: formatId,
+      label: label || job.full_format || `Format ${formatId}`,
+      type,
+      status: "ready",
+      downloadUrl: result.downloadUrl,
+      fullFormat: job.full_format || label,
+    };
+
+    cache.set(cacheKey, payload);
+    return payload;
+  } catch (err) {
+    return {
+      format: formatId,
+      label: label || `Format ${formatId}`,
+      type,
+      status: "error",
+      reason: err.message,
+    };
   }
-  return {
-    title: "YouTube Video",
-    author: "Creator",
-    thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-  };
 }
 
+// ─── YouTube oEmbed metadata ─────────────────────────────────────────────────
+
+async function getYouTubeMetadata(videoId) {
+  const oembedUrl =
+    `https://www.youtube.com/oembed` +
+    `?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}` +
+    `&format=json`;
+  try {
+    const meta = await fetchJSON(oembedUrl, 8000);
+    return {
+      title: meta.title || "YouTube Video",
+      authorName: meta.author_name || "Creator",
+      authorUrl: meta.author_url || "https://www.youtube.com/",
+      thumbnailUrl: meta.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+    };
+  } catch {
+    return {
+      title: "YouTube Video",
+      authorName: "Creator",
+      authorUrl: "https://www.youtube.com/",
+      thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+    };
+  }
+}
+
+// ─── Main Handler ─────────────────────────────────────────────────────────────
+
 module.exports = async function handler(req, res) {
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    return res.status(204).end();
+    res.status(204).end();
+    return;
   }
 
+  if (!["GET", "POST"].includes(req.method)) {
+    res.setHeader("Allow", "GET, POST, OPTIONS");
+    return sendJson(res, 405, { error: "Use GET or POST." });
+  }
+
+  // ── Validate YouTube URL ────────────────────────────────────────────────────
   const requestedUrl = getRequestedUrl(req);
   const videoId = getVideoId(requestedUrl);
 
@@ -215,163 +267,105 @@ module.exports = async function handler(req, res) {
       success: false,
       error: "A valid YouTube URL is required in 'url' parameter.",
       examples: [
-        "/api/youtube?url=https://youtu.be/dQw4w9WgXcQ",
-        "/api/youtube?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&quality=1080",
+        "/api/youtube?url=https://youtu.be/bmMNlw6wAAY",
+        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=1080",
+        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=720",
+        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=mp3",
       ],
     });
   }
 
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const requestedQuality = getRequestedQuality(req);
+  const targetQuality = getRequestedQuality(req);
   const startTime = Date.now();
 
   try {
-    // 1. Fetch Session from YouTubeToolkit
-    let session;
-    let meta;
+    // ── Fetch metadata first ──────────────────────────────────────────────────
+    const meta = await getYouTubeMetadata(videoId);
 
-    try {
-      session = await getYouTubeToolkitSession();
-      meta = await analyzeYouTubeVideo(ytUrl, session);
-    } catch (analysisErr) {
-      // Fallback metadata if analyze fails
-      const oembed = await getYouTubeOEmbed(videoId);
-      meta = {
-        video_id: videoId,
-        title: oembed.title,
-        channel_title: oembed.author,
-        thumbnail: oembed.thumbnail,
-        duration: "—",
-        watch_url: ytUrl,
-        embed_url: `https://www.youtube.com/embed/${videoId}`,
-        video_options: [
-          { mode: "video:1080", label: "Video 1080p (Full HD)" },
-          { mode: "video:720", label: "Video 720p (HD)" },
-          { mode: "video:480", label: "Video 480p (SD)" },
-          { mode: "video:360", label: "Video 360p" },
-        ],
-        audio_options: [
-          { mode: "audio:320", label: "MP3 320 kbps" },
-          { mode: "audio:192", label: "MP3 192 kbps" },
-        ],
-      };
-    }
-
-    // 2. Map requested mode
-    let targetMode = "video:1080";
-    if (requestedQuality === "720") targetMode = "video:720";
-    else if (requestedQuality === "480") targetMode = "video:480";
-    else if (requestedQuality === "360") targetMode = "video:360";
-    else if (requestedQuality === "1440" || requestedQuality === "2k") targetMode = "video:1440";
-    else if (requestedQuality === "4k" || requestedQuality === "2160") targetMode = "video:4k";
-    else if (requestedQuality === "mp3" || requestedQuality.includes("audio")) targetMode = "audio:320";
-    else if (requestedQuality.startsWith("video:") || requestedQuality.startsWith("audio:")) {
-      targetMode = requestedQuality;
-    }
-
-    // 3. Attempt direct DDL resolution via YouTubeToolkit
-    let directDownloadUrl = null;
-    let resolvedQuality = targetMode.replace("video:", "").replace("audio:", "");
-    let resolveError = null;
-
-    if (session) {
-      try {
-        const resolveData = await resolveYouTubeDDL(meta, targetMode, session);
-        if (resolveData.success && resolveData.data?.download_url) {
-          directDownloadUrl = resolveData.data.download_url;
-        } else if (resolveData.limit_reached) {
-          resolveError = resolveData.message || "Daily free resolution limit reached on server IP.";
-        } else {
-          resolveError = resolveData.message || "Could not resolve direct link for requested mode.";
-        }
-      } catch (err) {
-        resolveError = err.message;
-      }
-    }
-
-    // 4. Construct response with verified download buttons & options
-    const downloadLinks = [];
-
-    // If direct link was resolved
-    if (directDownloadUrl) {
-      downloadLinks.push({
-        format: resolvedQuality,
-        label: `Direct MP4 ${resolvedQuality}p (Full Download)`,
-        type: targetMode.startsWith("audio") ? "audio" : "video",
-        quality: `${resolvedQuality}p`,
-        downloadUrl: directDownloadUrl,
-        verified: true,
-      });
-    }
-
-    // Add quality selector options so frontend and Telegram bot can call each resolution
-    const videoOptions = meta.video_options || [];
-    for (const opt of videoOptions) {
-      const q = opt.mode.replace("video:", "");
-      downloadLinks.push({
-        format: q,
-        label: `${opt.label} — Direct DDL`,
-        type: "video",
-        quality: `${q}p`,
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${q}`,
-        downloadUrl: directDownloadUrl && q === resolvedQuality ? directDownloadUrl : undefined,
-        verified: true,
-      });
-    }
-
-    const audioOptions = meta.audio_options || [];
-    for (const opt of audioOptions) {
-      const q = opt.mode.replace("audio:", "");
-      downloadLinks.push({
-        format: `mp3-${q}`,
-        label: `${opt.label} — High Quality Audio`,
-        type: "audio",
-        quality: `${q}kbps`,
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=audio:${q}`,
-        verified: true,
-      });
-    }
-
-    // One-click direct web downloader link that runs in user's browser with their own IP
-    const browserAutoDownloadUrl = `https://youtubetoolkit.com/tools/video-downloader-1080p?url=${encodeURIComponent(ytUrl)}&download=1`;
-
-    const responsePayload = {
-      success: true,
-      service: "youtube",
-      provider: "youtubetoolkit.com",
-      videoId,
-      title: meta.title || "YouTube Video",
-      channel: meta.channel_title || "YouTube",
-      authorName: meta.channel_title || "YouTube",
-      thumbnailUrl: meta.thumbnail || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-      duration: meta.duration || "—",
-      sourceUrl: ytUrl,
-      watchUrl: ytUrl,
-      embedUrl: `https://www.youtube.com/embed/${videoId}`,
-      downloadUrl: directDownloadUrl || browserAutoDownloadUrl,
-      browserDownloadUrl: browserAutoDownloadUrl,
-      resolvedMode: targetMode,
-      downloadLinks,
-      mirrors: [
-        {
-          name: "⚡ 1-Click Browser HD Direct Download (No Daily Limit)",
-          type: "browser_direct",
-          url: browserAutoDownloadUrl,
-        },
-      ],
-      notice: directDownloadUrl
-        ? "Direct file stream generated successfully."
-        : "Direct server resolution limit reached. Use browserDownloadUrl for instant 1080p download without server limits.",
-      durationMs: Date.now() - startTime,
+    // ── Target primary format first (Fast, clean, no server overloading) ─────
+    const primaryFormat = ALL_FORMATS.find((f) => f.id === targetQuality) || {
+      id: targetQuality,
+      label: `MP4 ${targetQuality}p`,
+      type: targetQuality === "mp3" ? "audio" : "video",
     };
 
-    return sendJson(res, 200, responsePayload);
+    // Process primary format
+    const primaryResult = await processFormat(
+      ytUrl,
+      primaryFormat.id,
+      primaryFormat.label,
+      primaryFormat.type
+    );
+
+    // Construct download links list
+    const downloadLinks = [];
+
+    // If primary format succeeded, put it at the top
+    if (primaryResult.status === "ready" && primaryResult.downloadUrl) {
+      downloadLinks.push({
+        format: primaryResult.format,
+        label: `${primaryResult.label} (Primary Direct DDL)`,
+        type: primaryResult.type,
+        quality: `${primaryResult.format}${primaryResult.type === "audio" ? "kbps" : "p"}`,
+        downloadUrl: primaryResult.downloadUrl,
+        verified: true,
+      });
+    }
+
+    // Add all other supported formats with on-demand resolution endpoint
+    for (const fmt of ALL_FORMATS) {
+      if (fmt.id === primaryResult.format && primaryResult.downloadUrl) {
+        continue; // already added above
+      }
+
+      const cached = cache.get(`${ytUrl}_${fmt.id}`);
+      downloadLinks.push({
+        format: fmt.id,
+        label: fmt.label,
+        type: fmt.type,
+        quality: `${fmt.id}${fmt.type === "audio" ? "kbps" : "p"}`,
+        downloadUrl: cached?.downloadUrl || undefined,
+        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${fmt.id}`,
+        verified: !!cached?.downloadUrl,
+      });
+    }
+
+    const availableLinks = downloadLinks.filter((l) => !!l.downloadUrl);
+
+    // Build clean response
+    return sendJson(res, 200, {
+      success: true,
+      service: "youtube",
+      provider: "savenow-direct",
+      videoId,
+      title: meta.title,
+      authorName: meta.authorName,
+      authorUrl: meta.authorUrl,
+      thumbnailUrl: meta.thumbnailUrl,
+      sourceUrl: requestedUrl,
+      watchUrl: ytUrl,
+      embedUrl: `https://www.youtube.com/embed/${videoId}`,
+      
+      // ✅ Direct media file download link
+      downloadUrl: primaryResult.downloadUrl || null,
+      resolvedFormat: primaryResult.format,
+      
+      // ✅ All ready & on-demand download links
+      downloadLinks,
+      
+      summary: {
+        total: ALL_FORMATS.length,
+        ready: availableLinks.length,
+      },
+      durationMs: Date.now() - startTime,
+    });
   } catch (err) {
     console.error("YouTube extractor error:", err);
     return sendJson(res, 500, {
       success: false,
       service: "youtube",
-      error: err.message || "Failed to process YouTube video formats",
+      error: err.message || "Failed to process YouTube download link",
       durationMs: Date.now() - startTime,
     });
   }
