@@ -5,9 +5,15 @@
  * timeouts, and ad-redirection on p.savenow.to.
  *
  * Usage:
- *   GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=720
- *   POST /api/youtube   body: { "url": "https://youtu.be/VIDEO_ID", "quality": "1080" }
+ *   JSON API:
+ *     GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=720
+ *     POST /api/youtube   body: { "url": "https://youtu.be/VIDEO_ID", "quality": "1080" }
+ *
+ *   Direct Media Stream (No Ads Guaranteed):
+ *     GET  /api/youtube?url=https://youtu.be/VIDEO_ID&quality=720&stream=1
  */
+
+const { Readable } = require("stream");
 
 // ─── YouTube URL Parsing ──────────────────────────────────────────────────────
 
@@ -66,7 +72,7 @@ function getRequestedUrl(req) {
 
 function getRequestedQuality(req) {
   const q = req.method === "GET" ? req.query?.quality : req.body?.quality;
-  if (!q) return "720"; // default to fast 720p HD
+  if (!q) return "720"; // default to 720p HD
   const s = String(q).toLowerCase().replace("video:", "").replace("audio:", "");
   if (s === "mp3" || s.includes("audio")) return "mp3";
   return s;
@@ -84,11 +90,11 @@ function sendJson(res, status, data) {
 
 const SAVENOW_API_KEY  = "dfcb6d76f2f6a9894gjkege8a4ab232222";
 const SAVENOW_BASE     = "https://p.savenow.to";
-const POLL_INTERVAL_MS = 1500;          // poll every 1.5s
-const POLL_MAX_TRIES   = 20;            // max ~30s
+const POLL_INTERVAL_MS = 1500;
+const POLL_MAX_TRIES   = 20;
 const REQUEST_TIMEOUT  = 12000;
 
-// In-memory cache to prevent duplicate conversions and serve instantly
+// In-memory cache for fast repeat requests
 const cache = new Map();
 
 /** All supported formats */
@@ -228,7 +234,7 @@ async function getYouTubeMetadata(videoId) {
       title: meta.title || "YouTube Video",
       authorName: meta.author_name || "Creator",
       authorUrl: meta.author_url || "https://www.youtube.com/",
-      thumbnailUrl: meta.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+      thumbnailUrl: meta.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     };
   } catch {
     return {
@@ -253,9 +259,9 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  if (!["GET", "POST"].includes(req.method)) {
-    res.setHeader("Allow", "GET, POST, OPTIONS");
-    return sendJson(res, 405, { error: "Use GET or POST." });
+  if (!["GET", "POST", "HEAD"].includes(req.method)) {
+    res.setHeader("Allow", "GET, POST, HEAD, OPTIONS");
+    return sendJson(res, 405, { error: "Use GET, POST, or HEAD." });
   }
 
   // ── Validate YouTube URL ────────────────────────────────────────────────────
@@ -268,15 +274,16 @@ module.exports = async function handler(req, res) {
       error: "A valid YouTube URL is required in 'url' parameter.",
       examples: [
         "/api/youtube?url=https://youtu.be/bmMNlw6wAAY",
-        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=1080",
         "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=720",
-        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=mp3",
+        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=1080",
+        "/api/youtube?url=https://www.youtube.com/watch?v=bmMNlw6wAAY&quality=720&stream=1",
       ],
     });
   }
 
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const targetQuality = getRequestedQuality(req);
+  const isStreamRequest = req.query?.stream === "1";
   const startTime = Date.now();
 
   try {
@@ -298,6 +305,29 @@ module.exports = async function handler(req, res) {
       primaryFormat.type
     );
 
+    // If streaming binary is requested directly (e.g. for Telegram bot direct download without ads)
+    if (isStreamRequest && primaryResult.downloadUrl) {
+      try {
+        const streamResponse = await fetch(primaryResult.downloadUrl);
+        if (streamResponse.ok) {
+          const contentType = streamResponse.headers.get("content-type") || (primaryResult.type === "audio" ? "audio/mpeg" : "video/mp4");
+          const safeTitle = (meta.title || "video").replace(/[^\w\s.-]/gi, "_");
+          const ext = primaryResult.type === "audio" ? "mp3" : "mp4";
+          
+          res.setHeader("Content-Type", contentType);
+          res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.${ext}"`);
+          if (streamResponse.headers.get("content-length")) {
+            res.setHeader("Content-Length", streamResponse.headers.get("content-length"));
+          }
+          
+          const nodeStream = Readable.fromWeb(streamResponse.body);
+          return nodeStream.pipe(res);
+        }
+      } catch (streamErr) {
+        console.error("Stream pipe error:", streamErr);
+      }
+    }
+
     // Construct download links list
     const downloadLinks = [];
 
@@ -309,6 +339,7 @@ module.exports = async function handler(req, res) {
         type: primaryResult.type,
         quality: `${primaryResult.format}${primaryResult.type === "audio" ? "kbps" : "p"}`,
         downloadUrl: primaryResult.downloadUrl,
+        streamUrl: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${primaryResult.format}&stream=1`,
         verified: true,
       });
     }
@@ -316,7 +347,7 @@ module.exports = async function handler(req, res) {
     // Add all other supported formats with on-demand resolution endpoint
     for (const fmt of ALL_FORMATS) {
       if (fmt.id === primaryResult.format && primaryResult.downloadUrl) {
-        continue; // already added above
+        continue;
       }
 
       const cached = cache.get(`${ytUrl}_${fmt.id}`);
@@ -326,6 +357,7 @@ module.exports = async function handler(req, res) {
         type: fmt.type,
         quality: `${fmt.id}${fmt.type === "audio" ? "kbps" : "p"}`,
         downloadUrl: cached?.downloadUrl || undefined,
+        streamUrl: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${fmt.id}&stream=1`,
         url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${fmt.id}`,
         verified: !!cached?.downloadUrl,
       });
@@ -349,6 +381,12 @@ module.exports = async function handler(req, res) {
       
       // ✅ Direct media file download link
       downloadUrl: primaryResult.downloadUrl || null,
+      
+      // ✅ Direct binary streaming route (Zero ads guaranteed)
+      streamUrl: primaryResult.downloadUrl
+        ? `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=${primaryResult.format}&stream=1`
+        : null,
+
       resolvedFormat: primaryResult.format,
       
       // ✅ All ready & on-demand download links
