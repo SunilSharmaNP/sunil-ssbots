@@ -106,7 +106,7 @@ function formatDuration(sec) {
 }
 
 /**
- * High-Speed Ad-Free Converter Engine (cnv.cx CDN Tunnel)
+ * High-Speed Ad-Free Converter Engine (cnv.cx CDN Tunnel) with Auto-Retry
  */
 async function convertViaTunnel(videoId, requestedQuality = "1080") {
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -121,40 +121,65 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
     }
   }
 
-  // 1. Fetch info and key in parallel
-  const [infoPromise, keyPromise] = [
-    fetch("https://cnv.cx/v2/getVideoInfo", {
+  // 1. Fetch metadata info
+  let info = null;
+  try {
+    const infoRes = await fetch("https://cnv.cx/v2/getVideoInfo", {
       method: "POST",
       headers: {
         ...CNV_HEADERS,
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams({ link: ytUrl }),
-      signal: AbortSignal.timeout(8000),
-    })
-      .then((r) => r.json())
-      .catch(() => null),
-
-    fetch(`https://cnv.cx/v2/sanity/key?id=${videoId}`, {
-      headers: {
-        ...CNV_HEADERS,
-        accept: "*/*",
-        "content-type": "application/json",
-      },
-      signal: AbortSignal.timeout(8000),
-    })
-      .then((r) => r.json())
-      .catch(() => null),
-  ];
-
-  const [info, keyData] = await Promise.all([infoPromise, keyPromise]);
-  const key = keyData?.key;
-
-  if (!key) {
-    throw new Error("Could not acquire converter session token");
+      signal: AbortSignal.timeout(7000),
+    });
+    if (infoRes.ok) {
+      info = await infoRes.json();
+    }
+  } catch {
+    // Info fallback
   }
 
-  // 2. Request direct CDN conversion
+  // 2. Fetch converter sanity key with retry backoff
+  let key = null;
+  let lastKeyErr = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const keyRes = await fetch(`https://cnv.cx/v2/sanity/key?id=${videoId}`, {
+        headers: {
+          ...CNV_HEADERS,
+          accept: "application/json, text/plain, */*",
+        },
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (keyRes.status === 429) {
+        lastKeyErr = new Error("Converter temporary rate limit (429)");
+        await new Promise((r) => setTimeout(r, attempt * 800));
+        continue;
+      }
+
+      if (keyRes.ok) {
+        const keyData = await keyRes.json();
+        if (keyData && keyData.key) {
+          key = keyData.key;
+          break;
+        }
+      }
+    } catch (err) {
+      lastKeyErr = err;
+      await new Promise((r) => setTimeout(r, attempt * 500));
+    }
+  }
+
+  if (!key) {
+    throw new Error(
+      `Could not acquire converter session token: ${lastKeyErr?.message || "Rate limited or blocked"}`
+    );
+  }
+
+  // 3. Request direct CDN conversion
   const convRes = await fetch("https://cnv.cx/v2/converter", {
     method: "POST",
     headers: {
@@ -193,20 +218,29 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
 }
 
 /**
- * Fallback Local Extractor Engine (yt-dlp)
+ * Fallback Local Extractor Engine (yt-dlp) with absolute path detection
  */
 function extractWithYtDlp(ytUrl) {
   return new Promise((resolve, reject) => {
     const candidatePaths = [
       "/usr/local/bin/yt-dlp",
       "/usr/bin/yt-dlp",
+      "/app/applet/bin/yt-dlp",
       path.join(process.cwd(), "bin", "yt-dlp"),
+      path.join(__dirname, "..", "bin", "yt-dlp"),
       "/tmp/yt-dlp",
     ];
 
-    let binPath = candidatePaths.find((p) => fs.existsSync(p));
+    const binPath = candidatePaths.find((p) => {
+      try {
+        return fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    });
+
     if (!binPath) {
-      binPath = "yt-dlp";
+      return reject(new Error("Local yt-dlp binary is not installed on this system"));
     }
 
     const nodePath = fs.existsSync("/usr/local/bin/node")
@@ -219,6 +253,8 @@ function extractWithYtDlp(ytUrl) {
       "--dump-single-json",
       "--no-warnings",
       "--no-playlist",
+      "--extractor-args",
+      "youtube:player_client=android,web",
       ytUrl,
     ];
 
