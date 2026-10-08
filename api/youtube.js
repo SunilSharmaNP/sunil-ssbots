@@ -5,9 +5,7 @@
  *   GET  /api/youtube?url=https://youtu.be/VIDEO_ID
  *   POST /api/youtube   body: { "url": "https://youtu.be/VIDEO_ID" }
  *
- * Response: JSON with authentic, verified download links.
- * Fake 2K (1440p) and 4K (2160p) buttons are automatically filtered
- * out if the source video does not genuinely provide that resolution.
+ * Response: JSON with all available quality download links
  */
 
 // ─── YouTube URL Parsing ──────────────────────────────────────────────────────
@@ -54,11 +52,7 @@ function getRequestedUrl(req) {
   if (req.method === "GET") return req.query?.url;
   if (req.method === "POST") {
     if (typeof req.body === "string") {
-      try {
-        return JSON.parse(req.body)?.url;
-      } catch {
-        return null;
-      }
+      try { return JSON.parse(req.body)?.url; } catch { return null; }
     }
     return req.body?.url;
   }
@@ -66,40 +60,43 @@ function getRequestedUrl(req) {
 }
 
 function sendJson(res, status, data) {
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  return res.status(status).json(data);
+  res.status(status).setHeader("Content-Type", "application/json");
+  res.status(status).json(data);
 }
 
 // ─── Savenow.to API Configuration ────────────────────────────────────────────
 
 const SAVENOW_API_KEY  = "dfcb6d76f2f6a9894gjkege8a4ab232222";
 const SAVENOW_BASE     = "https://p.savenow.to";
-const POLL_INTERVAL_MS = 1500;          // poll every 1.5s
-const POLL_MAX_TRIES   = 22;            // max ~33s per format
+const POLL_INTERVAL_MS = 1800;          // poll every 1.8s
+const POLL_MAX_TRIES   = 25;            // max ~45s per format
 const REQUEST_TIMEOUT  = 12000;         // 12s per individual HTTP call
 
-/** Target formats with quality thresholds */
-const VIDEO_FORMATS = [
-  { id: "4k",   label: "MP4 4K (2160p)",  type: "video", minHeight: 1800, targetHeight: 2160 },
-  { id: "1440", label: "MP4 2K (1440p)",  type: "video", minHeight: 1200, targetHeight: 1440 },
-  { id: "1080", label: "MP4 1080p (FHD)", type: "video", minHeight: 900,  targetHeight: 1080 },
-  { id: "720",  label: "MP4 720p (HD)",   type: "video", minHeight: 600,  targetHeight: 720 },
-  { id: "480",  label: "MP4 480p (SD)",   type: "video", minHeight: 400,  targetHeight: 480 },
-  { id: "360",  label: "MP4 360p",        type: "video", minHeight: 300,  targetHeight: 360 },
-];
-
-const AUDIO_FORMATS = [
-  { id: "mp3",  label: "MP3 Audio (High Quality)", type: "audio" },
-  { id: "m4a",  label: "M4A Audio (AAC)",          type: "audio" },
-  { id: "flac", label: "FLAC Audio (Lossless)",     type: "audio" },
-  { id: "wav",  label: "WAV Audio",                 type: "audio" },
+/** All formats to try in parallel */
+const ALL_FORMATS = [
+  // ── Video ──────────────────────────────────────────────────────────────────
+  { id: "144",  label: "MP4 144p",  type: "video" },
+  { id: "240",  label: "MP4 240p",  type: "video" },
+  { id: "360",  label: "MP4 360p",  type: "video" },
+  { id: "480",  label: "MP4 480p",  type: "video" },
+  { id: "720",  label: "MP4 720p",  type: "video" },
+  { id: "1080", label: "MP4 1080p", type: "video" },
+  { id: "1440", label: "MP4 1440p", type: "video" },
+  { id: "4k",   label: "WEBM 4K",   type: "video" },
+  // ── Audio ──────────────────────────────────────────────────────────────────
+  { id: "mp3",  label: "MP3 Audio", type: "audio" },
+  { id: "m4a",  label: "M4A Audio", type: "audio" },
+  { id: "aac",  label: "AAC Audio", type: "audio" },
+  { id: "flac", label: "FLAC Audio",type: "audio" },
+  { id: "opus", label: "OPUS Audio",type: "audio" },
+  { id: "ogg",  label: "OGG Audio", type: "audio" },
+  { id: "wav",  label: "WAV Audio", type: "audio" },
 ];
 
 // ─── HTTP Helpers ─────────────────────────────────────────────────────────────
 
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
   "Referer":    "https://y2mate.yt/",
   "Origin":     "https://y2mate.yt",
 };
@@ -116,10 +113,6 @@ async function fetchJSON(url, timeoutMs = REQUEST_TIMEOUT) {
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 // ─── Step 1: Start a download job for one format ───────────────────────────────
 
 async function startDownload(ytUrl, format) {
@@ -131,13 +124,18 @@ async function startDownload(ytUrl, format) {
 
   const data = await fetchJSON(apiUrl);
 
+  // API returns { success: true, id, progress_url, title, ... }
   if (!data.success || !data.id || !data.progress_url) {
     throw new Error(data.message || "No job ID returned");
   }
-  return data;
+  return data; // { id, progress_url, title, thumbnail_url, full_format, ... }
 }
 
 // ─── Step 2: Poll progress until finished ────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 async function pollUntilDone(progressUrl) {
   for (let attempt = 0; attempt < POLL_MAX_TRIES; attempt++) {
@@ -146,7 +144,7 @@ async function pollUntilDone(progressUrl) {
     try {
       data = await fetchJSON(progressUrl);
     } catch {
-      continue;
+      continue; // network blip — retry
     }
 
     const status = (data.text || "").toLowerCase();
@@ -160,72 +158,14 @@ async function pollUntilDone(progressUrl) {
     if (status === "error" || status === "failed") {
       return { ok: false, reason: data.message || "conversion error" };
     }
+
+    // Still in progress (downloading / converting / preparing) — keep polling
   }
 
   return { ok: false, reason: "timed out after max polls" };
 }
 
-// ─── Step 3: Inspect Video Stream Real Resolution ─────────────────────────────
-
-/**
- * Reads the first 4-8 KB of an MP4 stream to extract authentic visual dimensions
- * from the ISO/IEC 14496-12 visual sample entry box (avc1, hev1, hvc1, vp09, av01).
- * Returns { width, height } or null.
- */
-async function inspectVideoResolution(streamUrl) {
-  if (!streamUrl) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
-
-  try {
-    const res = await fetch(streamUrl, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Range": "bytes=0-8192",
-      },
-    });
-
-    if (!res.body) return null;
-
-    const reader = res.body.getReader();
-    const chunks = [];
-    let bytesRead = 0;
-
-    while (bytesRead < 8192) {
-      const { done, value } = await reader.read();
-      if (done || !value) break;
-      chunks.push(value);
-      bytesRead += value.length;
-      if (bytesRead >= 2048) {
-        controller.abort();
-        break;
-      }
-    }
-
-    const buf = Buffer.concat(chunks);
-    for (const tag of ["avc1", "hev1", "hvc1", "vp09", "av01", "mp4v"]) {
-      let pos = 32;
-      while ((pos = buf.indexOf(Buffer.from(tag), pos)) !== -1) {
-        if (pos + 32 <= buf.length) {
-          const width = buf.readUInt16BE(pos + 28);
-          const height = buf.readUInt16BE(pos + 30);
-          if (width > 0 && height > 0 && width <= 8000 && height <= 5000) {
-            return { width, height };
-          }
-        }
-        pos += 4;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ─── Step 4: Process one format end-to-end ───────────────────────────────────
+// ─── Step 3: Process one format end-to-end ───────────────────────────────────
 
 async function processFormat(ytUrl, fmt) {
   try {
@@ -233,13 +173,7 @@ async function processFormat(ytUrl, fmt) {
     const result = await pollUntilDone(job.progress_url);
 
     if (!result.ok) {
-      return {
-        format: fmt.id,
-        label: fmt.label,
-        type: fmt.type,
-        status: "unavailable",
-        reason: result.reason,
-      };
+      return { format: fmt.id, label: fmt.label, type: fmt.type, status: "unavailable", reason: result.reason };
     }
 
     return {
@@ -249,17 +183,9 @@ async function processFormat(ytUrl, fmt) {
       status:      "ready",
       downloadUrl: result.downloadUrl,
       fullFormat:  job.full_format || fmt.label,
-      minHeight:   fmt.minHeight || 0,
-      targetHeight: fmt.targetHeight || 0,
     };
   } catch (err) {
-    return {
-      format: fmt.id,
-      label: fmt.label,
-      type: fmt.type,
-      status: "error",
-      reason: err.message,
-    };
+    return { format: fmt.id, label: fmt.label, type: fmt.type, status: "error", reason: err.message };
   }
 }
 
@@ -273,15 +199,15 @@ async function getYouTubeMetadata(videoId) {
   try {
     const meta = await fetchJSON(oembedUrl, 8000);
     return {
-      title:       meta.title         || "YouTube Video",
-      authorName:  meta.author_name   || "YouTube Creator",
+      title:       meta.title         || "Untitled",
+      authorName:  meta.author_name   || "Unknown",
       authorUrl:   meta.author_url    || "https://www.youtube.com/",
       thumbnailUrl: meta.thumbnail_url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     };
   } catch {
     return {
-      title: "YouTube Video",
-      authorName: "YouTube Creator",
+      title: "Untitled",
+      authorName: "Unknown",
       authorUrl: "https://www.youtube.com/",
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     };
@@ -296,14 +222,12 @@ module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
+  if (req.method === "OPTIONS") { res.status(204).end(); return; }
 
   if (!["GET", "POST"].includes(req.method)) {
     res.setHeader("Allow", "GET, POST, OPTIONS");
-    return sendJson(res, 405, { error: "Use GET or POST." });
+    sendJson(res, 405, { error: "Use GET or POST." });
+    return;
   }
 
   // ── Validate YouTube URL ────────────────────────────────────────────────────
@@ -311,187 +235,61 @@ module.exports = async function handler(req, res) {
   const videoId      = getVideoId(requestedUrl);
 
   if (!videoId) {
-    return sendJson(res, 400, {
-      success: false,
-      error: "A valid YouTube URL is required in 'url' parameter.",
+    sendJson(res, 400, {
+      error: "A valid YouTube URL is required.",
       examples: [
-        "?url=https://youtu.be/o6OTjEHms6g",
-        "?url=https://www.youtube.com/watch?v=o6OTjEHms6g",
+        "?url=https://youtu.be/NgfuIXhRB1Y",
+        "?url=https://www.youtube.com/watch?v=NgfuIXhRB1Y",
+        "?url=https://www.youtube.com/shorts/VIDEO_ID",
       ],
     });
+    return;
   }
 
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  try {
-    // ── Fetch metadata first ──────────────────────────────────────────────────
-    const meta = await getYouTubeMetadata(videoId);
+  // ── Fetch metadata + all formats in parallel ────────────────────────────────
+  const [meta, ...formatResults] = await Promise.all([
+    getYouTubeMetadata(videoId),
+    ...ALL_FORMATS.map((fmt) => processFormat(ytUrl, fmt)),
+  ]);
 
-    // ── Execute formats in parallel ──────────────────────────────────────────
-    const allCandidates = [...VIDEO_FORMATS, ...AUDIO_FORMATS];
-    const formatResults = await Promise.all(
-      allCandidates.map((fmt) => processFormat(ytUrl, fmt))
-    );
+  // ── Split into available / unavailable ─────────────────────────────────────
+  const available   = formatResults.filter((r) => r.status === "ready");
+  const unavailable = formatResults.filter((r) => r.status !== "ready");
 
-    const readyFormats = formatResults.filter((r) => r.status === "ready");
-    const failedFormats = formatResults.filter((r) => r.status !== "ready");
+  // ── Build clean response ───────────────────────────────────────────────────
+  sendJson(res, 200, {
+    videoId,
+    sourceUrl:    requestedUrl,
+    watchUrl:     ytUrl,
+    embedUrl:     `https://www.youtube.com/embed/${videoId}`,
+    title:        meta.title,
+    authorName:   meta.authorName,
+    authorUrl:    meta.authorUrl,
+    thumbnailUrl: meta.thumbnailUrl,
 
-    // ── Verify Video Resolutions & Discard Fake 2K / 4K / 1080p ─────────────
-    // For every ready video format, inspect its stream header to verify actual resolution.
-    const verifiedVideoLinks = [];
-    const seenDimensions = new Set();
-    const seenUrls = new Set();
+    // ✅ All ready-to-download links
+    downloadLinks: available.map((r) => ({
+      format:      r.format,
+      label:       r.label,
+      type:        r.type,
+      fullFormat:  r.fullFormat,
+      downloadUrl: r.downloadUrl,
+    })),
 
-    // Check video formats from highest to lowest
-    const readyVideos = readyFormats.filter((r) => r.type === "video");
-    const readyAudios = readyFormats.filter((r) => r.type === "audio");
+    // ℹ️ Summary counts
+    summary: {
+      total:       ALL_FORMATS.length,
+      available:   available.length,
+      unavailable: unavailable.length,
+    },
 
-    // Pre-fetch resolutions for all ready videos in parallel
-    const resolutionMap = new Map();
-    await Promise.all(
-      readyVideos.map(async (vid) => {
-        const resData = await inspectVideoResolution(vid.downloadUrl);
-        if (resData) resolutionMap.set(vid.downloadUrl, resData);
-      })
-    );
-
-    for (const vid of readyVideos) {
-      if (seenUrls.has(vid.downloadUrl)) {
-        continue; // duplicate link discarded
-      }
-
-      // Read real resolution from map
-      const resData = resolutionMap.get(vid.downloadUrl);
-
-      if (resData && resData.height) {
-        const realHeight = resData.height;
-        const realWidth = resData.width;
-
-        // FAKE QUALITY REJECTION LOGIC:
-        // If format requested 4K (min 1800p), but actual stream height is only 720p or 1080p -> REJECT!
-        if (vid.format === "4k" && realHeight < 1800) {
-          failedFormats.push({
-            format: "4k",
-            label: vid.label,
-            reason: `Fake 4K rejected: Stream real resolution is only ${realWidth}x${realHeight}p`,
-          });
-          continue;
-        }
-
-        // If format requested 1440p (2K), but actual stream height is only 720p or 1080p -> REJECT!
-        if (vid.format === "1440" && realHeight < 1200) {
-          failedFormats.push({
-            format: "1440",
-            label: vid.label,
-            reason: `Fake 2K (1440p) rejected: Stream real resolution is only ${realWidth}x${realHeight}p`,
-          });
-          continue;
-        }
-
-        // If format requested 1080p, but actual stream height is only 720p or lower -> REJECT!
-        if (vid.format === "1080" && realHeight < 900) {
-          failedFormats.push({
-            format: "1080",
-            label: vid.label,
-            reason: `Fake 1080p rejected: Stream real resolution is only ${realWidth}x${realHeight}p`,
-          });
-          continue;
-        }
-
-        // Duplicate resolution check: if another button already has this exact resolution
-        const dimKey = `${realWidth}x${realHeight}`;
-        if (seenDimensions.has(dimKey)) {
-          continue; // Don't create multiple identical buttons for the same video stream
-        }
-        seenDimensions.add(dimKey);
-
-        seenUrls.add(vid.downloadUrl);
-        verifiedVideoLinks.push({
-          format: vid.format,
-          label: `MP4 ${realHeight}p (${realWidth}x${realHeight})`,
-          type: "video",
-          quality: `${realHeight}p`,
-          fullFormat: `mp4 [${realHeight}p]`,
-          downloadUrl: vid.downloadUrl,
-          verified: true,
-          realResolution: `${realWidth}x${realHeight}`,
-        });
-      } else {
-        // Fallback if range reading is blocked by upstream CDN:
-        // Only allow standard <=1080p, do NOT allow unverified 1440p or 4k
-        if (vid.format === "4k" || vid.format === "1440") {
-          failedFormats.push({
-            format: vid.format,
-            label: vid.label,
-            reason: `Unverified ${vid.format}: High resolution not confirmed by YouTube stream.`,
-          });
-          continue;
-        }
-
-        if (!seenUrls.has(vid.downloadUrl)) {
-          seenUrls.add(vid.downloadUrl);
-          verifiedVideoLinks.push({
-            format: vid.format,
-            label: vid.label,
-            type: "video",
-            quality: `${vid.targetHeight}p`,
-            fullFormat: vid.fullFormat,
-            downloadUrl: vid.downloadUrl,
-            verified: false,
-          });
-        }
-      }
-    }
-
-    // Audio links (always authentic audio streams)
-    const verifiedAudioLinks = readyAudios.map((a) => ({
-      format: a.format,
-      label: a.label,
-      type: "audio",
-      quality: a.format.toUpperCase(),
-      fullFormat: a.fullFormat,
-      downloadUrl: a.downloadUrl,
-    }));
-
-    const finalDownloadLinks = [...verifiedVideoLinks, ...verifiedAudioLinks];
-
-    // Response
-    return sendJson(res, 200, {
-      success: true,
-      service: "youtube",
-      videoId,
-      title: meta.title,
-      authorName: meta.authorName,
-      authorUrl: meta.authorUrl,
-      thumbnailUrl: meta.thumbnailUrl,
-      sourceUrl: requestedUrl,
-      watchUrl: ytUrl,
-      embedUrl: `https://www.youtube.com/embed/${videoId}`,
-
-      // Only real, verified download links (NO fake 2K/4K/1080p buttons)
-      downloadLinks: finalDownloadLinks,
-
-      // Summary counts
-      summary: {
-        totalCandidates: allCandidates.length,
-        verifiedAvailable: finalDownloadLinks.length,
-        videosAvailable: verifiedVideoLinks.length,
-        audiosAvailable: verifiedAudioLinks.length,
-        rejectedFakeFormats: failedFormats.length,
-      },
-
-      // Filtered out / rejected fake formats log
-      rejectedOrUnavailable: failedFormats.map((f) => ({
-        format: f.format,
-        label: f.label,
-        reason: f.reason,
-      })),
-    });
-  } catch (err) {
-    return sendJson(res, 500, {
-      success: false,
-      error: "Failed to process YouTube video formats",
-      details: err.message,
-    });
-  }
+    // ⚠️ Failed/unavailable formats (for debugging)
+    unavailableFormats: unavailable.map((r) => ({
+      format: r.format,
+      label:  r.label,
+      reason: r.reason,
+    })),
+  });
 };
