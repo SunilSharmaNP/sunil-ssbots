@@ -128,12 +128,27 @@ module.exports = async function handler(req, res) {
         break;
       }
 
+      case "youtube": {
+        const youtubeHandler = require("./youtube.js");
+        return youtubeHandler(req, res);
+      }
+
+      case "terabox": {
+        const teraboxHandler = require("./terabox.js");
+        return teraboxHandler(req, res);
+      }
+
+      case "diskwala": {
+        const diskwalaHandler = require("./diskwala.js");
+        return diskwalaHandler(req, res);
+      }
+
       default:
         return sendJson(res, 400, {
           success: false,
           error: `Unsupported service or unrecognized URL: ${url}`,
           detectedService: service,
-          supportedServices: ["hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain", "vikingfile"],
+          supportedServices: ["youtube", "terabox", "diskwala", "hubcloud", "gdflix", "hubdrive", "multicloud", "gofile", "pixeldrain", "vikingfile"],
         });
     }
 
