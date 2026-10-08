@@ -16,6 +16,10 @@ const path = require("path");
 const fs = require("fs");
 const { Readable } = require("stream");
 
+// In-memory cache for fast 0ms repeated responses & rate-limit immunity
+const videoCache = new Map();
+const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
 const YOUTUBE_HOSTS = new Set([
   "www.youtube.com",
   "youtube.com",
@@ -106,11 +110,16 @@ function formatDuration(sec) {
 }
 
 /**
- * High-Speed Ad-Free Converter Engine (cnv.cx CDN Tunnel) with Auto-Retry
+ * High-Speed Ad-Free Converter Engine (cnv.cx CDN Tunnel) with Auto-Retry & Cache
  */
 async function convertViaTunnel(videoId, requestedQuality = "1080") {
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cacheKey = `${videoId}:${requestedQuality}`;
+  const cached = videoCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
 
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const isAudio =
     requestedQuality === "mp3" || requestedQuality.includes("audio");
   const format = isAudio ? "mp3" : "mp4";
@@ -137,10 +146,10 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
       info = await infoRes.json();
     }
   } catch {
-    // Info fallback
+    // fallback
   }
 
-  // 2. Fetch converter sanity key with retry backoff
+  // 2. Fetch converter sanity key with backoff retry
   let key = null;
   let lastKeyErr = null;
 
@@ -155,7 +164,7 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
       });
 
       if (keyRes.status === 429) {
-        lastKeyErr = new Error("Converter temporary rate limit (429)");
+        lastKeyErr = new Error("Converter rate limit (429)");
         await new Promise((r) => setTimeout(r, attempt * 800));
         continue;
       }
@@ -203,7 +212,7 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
     throw new Error(convData?.errorMsg || "Converter did not return a valid download tunnel");
   }
 
-  return {
+  const result = {
     url: convData.url,
     filename: convData.filename || `${videoId}.${format}`,
     format,
@@ -215,10 +224,14 @@ async function convertViaTunnel(videoId, requestedQuality = "1080") {
     thumbnail:
       info?.thumbnail || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
   };
+
+  // Cache successful conversion
+  videoCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  return result;
 }
 
 /**
- * Fallback Local Extractor Engine (yt-dlp) with absolute path detection
+ * Fallback Local Extractor Engine (yt-dlp)
  */
 function extractWithYtDlp(ytUrl) {
   return new Promise((resolve, reject) => {
@@ -335,7 +348,7 @@ module.exports = async function handler(req, res) {
   const startTime = Date.now();
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // Direct Browser Download Proxy Stream
+  // Direct 1-Click Browser Download Proxy Stream
   if (
     req.method === "GET" &&
     (req.query?.stream === "1" || req.query?.download === "1")
@@ -380,18 +393,22 @@ module.exports = async function handler(req, res) {
   try {
     const primary = await convertViaTunnel(videoId, requestedQuality);
 
+    // Guaranteed direct 1-click download URLs that stream directly to browser with attachment header
+    const direct1ClickUrl = `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=${primary.videoQuality}`;
+
     const downloadLinks = [
       {
         format: primary.format === "mp3" ? "mp3" : `${primary.videoQuality}p`,
         label:
           primary.format === "mp3"
-            ? "🎵 High-Quality MP3 Audio (320kbps - Direct DDL)"
-            : `⚡ Direct MP4 (${primary.videoQuality}p Full HD - No Ads)`,
+            ? "🎵 High-Quality MP3 Audio (320kbps - Direct Download)"
+            : `⚡ Direct MP4 (${primary.videoQuality}p Full HD - 1-Click Download)`,
         type: primary.format === "mp3" ? "audio" : "video",
         quality:
           primary.format === "mp3" ? "320kbps" : `${primary.videoQuality}p`,
-        downloadUrl: primary.url,
-        browserDownloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=${primary.videoQuality}`,
+        url: direct1ClickUrl,
+        downloadUrl: direct1ClickUrl,
+        rawCdnUrl: primary.url,
         filename: primary.filename,
         verified: true,
       },
@@ -400,8 +417,8 @@ module.exports = async function handler(req, res) {
         label: "🎬 1080p Full HD MP4 Direct Download",
         type: "video",
         quality: "1080p",
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=1080`,
-        browserDownloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=1080`,
+        url: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=1080`,
+        downloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=1080`,
         verified: true,
       },
       {
@@ -409,8 +426,8 @@ module.exports = async function handler(req, res) {
         label: "🎬 720p HD MP4 Direct Download",
         type: "video",
         quality: "720p",
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=720`,
-        browserDownloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=720`,
+        url: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=720`,
+        downloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=720`,
         verified: true,
       },
       {
@@ -418,8 +435,8 @@ module.exports = async function handler(req, res) {
         label: "📱 360p Fast Mobile MP4 Direct Download",
         type: "video",
         quality: "360p",
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=360`,
-        browserDownloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=360`,
+        url: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=360`,
+        downloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=360`,
         verified: true,
       },
       {
@@ -427,13 +444,11 @@ module.exports = async function handler(req, res) {
         label: "🎧 320kbps MP3 Audio Direct Download",
         type: "audio",
         quality: "320kbps",
-        url: `/api/youtube?url=${encodeURIComponent(ytUrl)}&quality=mp3`,
-        browserDownloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=mp3`,
+        url: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=mp3`,
+        downloadUrl: `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=mp3`,
         verified: true,
       },
     ];
-
-    const browserDownloadUrl = `/api/youtube?stream=1&url=${encodeURIComponent(ytUrl)}&quality=${primary.videoQuality}`;
 
     const responsePayload = {
       success: true,
@@ -449,16 +464,16 @@ module.exports = async function handler(req, res) {
       sourceUrl: ytUrl,
       watchUrl: ytUrl,
       embedUrl: `https://www.youtube.com/embed/${videoId}`,
-      directDownloadUrl: primary.url,
-      downloadUrl: primary.url,
-      browserDownloadUrl,
+      directDownloadUrl: direct1ClickUrl,
+      downloadUrl: direct1ClickUrl,
+      rawCdnUrl: primary.url,
       filename: primary.filename,
       downloadLinks,
       mirrors: [
         {
-          name: "⚡ 1-Click Browser Direct Download (No Ads / Attachment)",
-          type: "browser_direct",
-          url: browserDownloadUrl,
+          name: "⚡ Direct 1-Click Download (Instant Attachment)",
+          type: "direct_stream",
+          url: direct1ClickUrl,
         },
         {
           name: "🌐 Y2Mate Web Mirror (External Browser Portal)",
@@ -466,7 +481,7 @@ module.exports = async function handler(req, res) {
           url: "https://v38.www-y2mate.com/",
         },
       ],
-      notice: "Direct authentic CDN download stream generated successfully without ads.",
+      notice: "Direct authentic media stream generated successfully without ads.",
       durationMs: Date.now() - startTime,
     };
 
