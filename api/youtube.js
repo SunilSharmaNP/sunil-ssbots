@@ -192,22 +192,22 @@ const HEADERS = {
 
 /** Formats registry */
 const FORMAT_MAP = {
-  "1080": { id: "1080", label: "MP4 1080p FHD", type: "video" },
-  "720":  { id: "720",  label: "MP4 720p HD",   type: "video" },
-  "480":  { id: "480",  label: "MP4 480p SD",   type: "video" },
-  "360":  { id: "360",  label: "MP4 360p Low",  type: "video" },
-  "240":  { id: "240",  label: "MP4 240p Low",  type: "video" },
-  "144":  { id: "144",  label: "MP4 144p Low",  type: "video" },
-  "1440": { id: "1440", label: "MP4 1440p 2K",  type: "video" },
-  "4k":   { id: "4k",   label: "WEBM 4K UHD",   type: "video" },
-  "2160": { id: "4k",   label: "WEBM 4K UHD",   type: "video" },
-  "mp3":  { id: "mp3",  label: "MP3 Audio (320kbps)", type: "audio" },
-  "m4a":  { id: "m4a",  label: "M4A Audio",     type: "audio" },
-  "aac":  { id: "aac",  label: "AAC Audio",     type: "audio" },
-  "flac": { id: "flac", label: "FLAC Audio",    type: "audio" },
-  "opus": { id: "opus", label: "OPUS Audio",    type: "audio" },
-  "ogg":  { id: "ogg",  label: "OGG Audio",     type: "audio" },
-  "wav":  { id: "wav",  label: "WAV Audio",     type: "audio" },
+  "1080": { id: "1080", quality: "1080p", label: "MP4 1080p FHD (Video + Audio)", type: "video", hasAudio: true, hasVideo: true },
+  "720":  { id: "720",  quality: "720p",  label: "MP4 720p HD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true },
+  "480":  { id: "480",  quality: "480p",  label: "MP4 480p SD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true },
+  "360":  { id: "360",  quality: "360p",  label: "MP4 360p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true },
+  "240":  { id: "240",  quality: "240p",  label: "MP4 240p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true },
+  "144":  { id: "144",  quality: "144p",  label: "MP4 144p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true },
+  "1440": { id: "1440", quality: "1440p", label: "MP4 1440p 2K (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true },
+  "4k":   { id: "4k",   quality: "4k",    label: "WEBM 4K UHD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true },
+  "2160": { id: "4k",   quality: "4k",    label: "WEBM 4K UHD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true },
+  "mp3":  { id: "mp3",  quality: "320kbps", label: "MP3 Audio Only",             type: "audio", hasAudio: true, hasVideo: false },
+  "m4a":  { id: "m4a",  quality: "128kbps", label: "M4A Audio Only",             type: "audio", hasAudio: true, hasVideo: false },
+  "aac":  { id: "aac",  quality: "128kbps", label: "AAC Audio Only",             type: "audio", hasAudio: true, hasVideo: false },
+  "flac": { id: "flac", quality: "Lossless", label: "FLAC Audio Only",           type: "audio", hasAudio: true, hasVideo: false },
+  "opus": { id: "opus", quality: "160kbps", label: "OPUS Audio Only",           type: "audio", hasAudio: true, hasVideo: false },
+  "ogg":  { id: "ogg",  quality: "192kbps", label: "OGG Audio Only",             type: "audio", hasAudio: true, hasVideo: false },
+  "wav":  { id: "wav",  quality: "Lossless", label: "WAV Audio Only",            type: "audio", hasAudio: true, hasVideo: false },
 };
 
 /** Default balanced formats when none specified */
@@ -216,6 +216,18 @@ const DEFAULT_FORMATS = [
   FORMAT_MAP["720"],
   FORMAT_MAP["480"],
   FORMAT_MAP["360"],
+  FORMAT_MAP["mp3"],
+  FORMAT_MAP["m4a"],
+];
+
+const VIDEO_ONLY_FORMATS = [
+  FORMAT_MAP["1080"],
+  FORMAT_MAP["720"],
+  FORMAT_MAP["480"],
+  FORMAT_MAP["360"],
+];
+
+const AUDIO_ONLY_FORMATS = [
   FORMAT_MAP["mp3"],
   FORMAT_MAP["m4a"],
 ];
@@ -547,12 +559,17 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  const typeFilter = (req.query?.type || req.query?.only || "").toLowerCase();
   const wantAll = req.query?.all === "true" || req.body?.all === true;
 
   // 2. Select target formats to convert
   let targetFormats;
   if (requestedFmtId && FORMAT_MAP[requestedFmtId.toLowerCase()]) {
     targetFormats = [FORMAT_MAP[requestedFmtId.toLowerCase()]];
+  } else if (typeFilter === "video" || req.query?.videoOnly === "true") {
+    targetFormats = VIDEO_ONLY_FORMATS;
+  } else if (typeFilter === "audio" || req.query?.audioOnly === "true") {
+    targetFormats = AUDIO_ONLY_FORMATS;
   } else if (wantAll) {
     targetFormats = ALL_FORMAT_LIST;
   } else {
@@ -572,16 +589,63 @@ module.exports = async function handler(req, res) {
     const available   = formatResults.filter((r) => r.status === "ready");
     const unavailable = formatResults.filter((r) => r.status !== "ready");
 
-    // Preferred primary download link (720p > 1080p > first available)
+    // Preferred primary download link (1080p > 720p > first available video > first available)
     const primary =
-      available.find((r) => r.format === "720") ||
       available.find((r) => r.format === "1080") ||
+      available.find((r) => r.format === "720") ||
+      available.find((r) => r.type === "video") ||
       available[0] ||
       null;
 
     const primaryDirectUrl = primary
       ? `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${primary.format}&dl=true`
       : null;
+
+    // Filter into separate Video (Video + Audio mixed) and Audio-only lists
+    const videos = available
+      .filter((r) => r.type === "video")
+      .map((r) => {
+        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
+        return {
+          format:      r.format,
+          quality:     FORMAT_MAP[r.format]?.quality || r.format,
+          label:       r.label,
+          hasAudio:    true,  // Both video & audio are mixed
+          hasVideo:    true,
+          downloadUrl: directUrl,
+          upstreamUrl: r.downloadUrl,
+        };
+      });
+
+    const audios = available
+      .filter((r) => r.type === "audio")
+      .map((r) => {
+        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
+        return {
+          format:      r.format,
+          quality:     FORMAT_MAP[r.format]?.quality || r.format,
+          label:       r.label,
+          hasAudio:    true,
+          hasVideo:    false,
+          downloadUrl: directUrl,
+          upstreamUrl: r.downloadUrl,
+        };
+      });
+
+    // Clean deduplicated download list (no duplicate keys)
+    const downloadLinks = available.map((r) => {
+      const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
+      return {
+        format:      r.format,
+        quality:     FORMAT_MAP[r.format]?.quality || r.format,
+        label:       r.label,
+        type:        r.type,
+        hasAudio:    true,
+        hasVideo:    r.type === "video",
+        downloadUrl: directUrl,
+        upstreamUrl: r.downloadUrl,
+      };
+    });
 
     return sendJson(res, 200, {
       success:       available.length > 0,
@@ -594,40 +658,16 @@ module.exports = async function handler(req, res) {
       authorUrl:     meta.authorUrl,
       thumbnailUrl:  meta.thumbnailUrl,
 
-      // Zero-Ad Direct Download Links (Streams clean MP4/MP3 straight through server)
+      // Best Direct Download Link (defaults to highest resolution Video+Audio)
       downloadUrl:   primaryDirectUrl,
-      directDownloadUrl: primaryDirectUrl,
-      streamUrl:     primaryDirectUrl,
       upstreamUrl:   primary ? primary.downloadUrl : null,
 
-      // All ready direct download links (no ad redirect)
-      downloadLinks: available.map((r) => {
-        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
-        return {
-          format:            r.format,
-          label:             r.label,
-          type:              r.type,
-          fullFormat:        r.fullFormat,
-          downloadUrl:       directUrl,
-          directDownloadUrl: directUrl,
-          upstreamUrl:       r.downloadUrl,
-          url:               directUrl,
-        };
-      }),
+      // Categorized & Deduplicated Lists
+      videos,
+      audios,
 
-      // Alias formats array for bot compatibility
-      formats: available.map((r) => {
-        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
-        return {
-          format:            r.format,
-          quality:           r.label,
-          type:              r.type,
-          url:               directUrl,
-          downloadUrl:       directUrl,
-          directDownloadUrl: directUrl,
-          upstreamUrl:       r.downloadUrl,
-        };
-      }),
+      // Clean unified download list (no duplicated internal keys)
+      downloadLinks,
 
       // Summary counts
       summary: {
