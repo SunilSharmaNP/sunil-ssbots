@@ -632,21 +632,6 @@ module.exports = async function handler(req, res) {
         };
       });
 
-    // Clean deduplicated download list (no duplicate keys)
-    const downloadLinks = available.map((r) => {
-      const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
-      return {
-        format:      r.format,
-        quality:     FORMAT_MAP[r.format]?.quality || r.format,
-        label:       r.label,
-        type:        r.type,
-        hasAudio:    true,
-        hasVideo:    r.type === "video",
-        downloadUrl: directUrl,
-        upstreamUrl: r.downloadUrl,
-      };
-    });
-
     return sendJson(res, 200, {
       success:       available.length > 0,
       videoId,
@@ -662,12 +647,9 @@ module.exports = async function handler(req, res) {
       downloadUrl:   primaryDirectUrl,
       upstreamUrl:   primary ? primary.downloadUrl : null,
 
-      // Categorized & Deduplicated Lists
+      // Deduplicated Lists: Videos (Video + Audio mixed) and Audios (Audio Only)
       videos,
       audios,
-
-      // Clean unified download list (no duplicated internal keys)
-      downloadLinks,
 
       // Summary counts
       summary: {
