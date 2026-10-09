@@ -14,6 +14,91 @@
  */
 
 const crypto = require("crypto");
+const { Readable } = require("stream");
+
+function getBaseUrl(req) {
+  const host = req.headers?.host || (req.get && req.get("host")) || "localhost:3000";
+  const proto = req.headers?.["x-forwarded-proto"] || req.protocol || "https";
+  return `${proto}://${host}`;
+}
+
+async function streamMediaDirectly(downloadUrl, title, fmtInfo, res, retryYtUrl = null) {
+  try {
+    let targetUrl = downloadUrl;
+    let upstreamRes = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://y2mate.yt/",
+        "Origin": "https://y2mate.yt",
+      },
+      redirect: "follow",
+    });
+
+    let contentType = upstreamRes.headers.get("content-type") || "";
+
+    // If upstream redirected to an ad HTML page or expired token, re-mint immediately
+    if (contentType.includes("text/html") || upstreamRes.url.includes("ad/b.php") || upstreamRes.url.includes("ey43.com")) {
+      if (retryYtUrl) {
+        cachedToken = null;
+        const freshToken = await getValidToken();
+        const freshJob = await processFormat(retryYtUrl, fmtInfo, freshToken);
+        if (freshJob && freshJob.status === "ready" && freshJob.downloadUrl) {
+          targetUrl = freshJob.downloadUrl;
+          upstreamRes = await fetch(targetUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+              "Referer": "https://y2mate.yt/",
+              "Origin": "https://y2mate.yt",
+            },
+            redirect: "follow",
+          });
+          contentType = upstreamRes.headers.get("content-type") || "";
+        }
+      }
+    }
+
+    if (!upstreamRes.ok || contentType.includes("text/html")) {
+      return sendJson(res, 502, {
+        success: false,
+        error: "Upstream media server returned an ad/expired token. Please retry the request to generate a fresh stream.",
+      });
+    }
+
+    const finalContentType = contentType || (fmtInfo?.type === "audio" ? "audio/mpeg" : "video/mp4");
+    const ext = fmtInfo?.type === "audio" ? (fmtInfo.id === "m4a" ? "m4a" : "mp3") : "mp4";
+    const cleanTitle = (title || "video").replace(/[^\w\s\-\.\u0900-\u097F]/gi, "").trim() || "download";
+    const filename = `${cleanTitle}.${ext}`;
+
+    res.setHeader("Content-Type", finalContentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    const contentLength = upstreamRes.headers.get("content-length");
+    if (contentLength) {
+      res.setHeader("Content-Length", contentLength);
+    }
+
+    if (res.req && res.req.method === "HEAD") {
+      return res.status(200).end();
+    }
+
+    const nodeStream = Readable.fromWeb(upstreamRes.body);
+    nodeStream.on("error", () => {
+      if (!res.writableEnded) res.end();
+    });
+    res.on("close", () => {
+      nodeStream.destroy();
+    });
+    nodeStream.pipe(res);
+  } catch (err) {
+    if (!res.headersSent) {
+      return sendJson(res, 500, {
+        success: false,
+        error: `Streaming failed: ${err.message}`,
+      });
+    }
+  }
+}
 
 // ─── YouTube URL Parsing ──────────────────────────────────────────────────────
 
@@ -402,8 +487,17 @@ module.exports = async function handler(req, res) {
     return res.status(204).end();
   }
 
-  if (!["GET", "POST"].includes(req.method)) {
-    return sendJson(res, 405, { success: false, error: "Method not allowed. Use GET or POST." });
+  if (!["GET", "POST", "HEAD"].includes(req.method)) {
+    return sendJson(res, 405, { success: false, error: "Method not allowed. Use GET, POST, or HEAD." });
+  }
+
+  // 0. Support proxy streaming if requested
+  if (req.query?.proxy) {
+    const proxyUrl = req.query.proxy;
+    const title = req.query.title || "video";
+    const fmt = { id: req.query.format || "720", type: req.query.type || "video" };
+    const retryYt = req.query.ytUrl ? decodeURIComponent(req.query.ytUrl) : null;
+    return streamMediaDirectly(proxyUrl, title, fmt, res, retryYt);
   }
 
   // 1. Validate YouTube URL
@@ -424,6 +518,35 @@ module.exports = async function handler(req, res) {
 
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const requestedFmtId = getRequestedFormat(req);
+  const isDirectDownload = req.query?.dl === "true" || req.query?.stream === "true" || req.query?.download === "true";
+  const baseUrl = getBaseUrl(req);
+
+  // If client wants direct media stream (no ads, zero redirection)
+  if (isDirectDownload) {
+    const targetFmt = FORMAT_MAP[requestedFmtId ? requestedFmtId.toLowerCase() : "720"] || FORMAT_MAP["720"];
+    try {
+      const token = await getValidToken();
+      const [meta, job] = await Promise.all([
+        getYouTubeMetadata(videoId),
+        processFormat(ytUrl, targetFmt, token),
+      ]);
+
+      if (job && job.status === "ready" && job.downloadUrl) {
+        return streamMediaDirectly(job.downloadUrl, meta.title, targetFmt, res, ytUrl);
+      } else {
+        return sendJson(res, 502, {
+          success: false,
+          error: job?.reason || "Failed to resolve stream for this format",
+        });
+      }
+    } catch (err) {
+      return sendJson(res, 500, {
+        success: false,
+        error: err.message || "Failed to stream media",
+      });
+    }
+  }
+
   const wantAll = req.query?.all === "true" || req.body?.all === true;
 
   // 2. Select target formats to convert
@@ -456,8 +579,9 @@ module.exports = async function handler(req, res) {
       available[0] ||
       null;
 
-    // Stream link
-    const streamCandidate = available.find((r) => r.type === "video");
+    const primaryDirectUrl = primary
+      ? `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${primary.format}&dl=true`
+      : null;
 
     return sendJson(res, 200, {
       success:       available.length > 0,
@@ -470,28 +594,40 @@ module.exports = async function handler(req, res) {
       authorUrl:     meta.authorUrl,
       thumbnailUrl:  meta.thumbnailUrl,
 
-      // Top direct download link (ready for 1-click or bot download)
-      downloadUrl:   primary ? primary.downloadUrl : null,
-      streamUrl:     streamCandidate ? streamCandidate.downloadUrl : null,
+      // Zero-Ad Direct Download Links (Streams clean MP4/MP3 straight through server)
+      downloadUrl:   primaryDirectUrl,
+      directDownloadUrl: primaryDirectUrl,
+      streamUrl:     primaryDirectUrl,
+      upstreamUrl:   primary ? primary.downloadUrl : null,
 
-      // All ready direct download links
-      downloadLinks: available.map((r) => ({
-        format:      r.format,
-        label:       r.label,
-        type:        r.type,
-        fullFormat:  r.fullFormat,
-        downloadUrl: r.downloadUrl,
-        url:         r.downloadUrl,
-      })),
+      // All ready direct download links (no ad redirect)
+      downloadLinks: available.map((r) => {
+        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
+        return {
+          format:            r.format,
+          label:             r.label,
+          type:              r.type,
+          fullFormat:        r.fullFormat,
+          downloadUrl:       directUrl,
+          directDownloadUrl: directUrl,
+          upstreamUrl:       r.downloadUrl,
+          url:               directUrl,
+        };
+      }),
 
       // Alias formats array for bot compatibility
-      formats: available.map((r) => ({
-        format:      r.format,
-        quality:     r.label,
-        type:        r.type,
-        url:         r.downloadUrl,
-        downloadUrl: r.downloadUrl,
-      })),
+      formats: available.map((r) => {
+        const directUrl = `${baseUrl}/api/youtube?url=${encodeURIComponent(ytUrl)}&format=${r.format}&dl=true`;
+        return {
+          format:            r.format,
+          quality:           r.label,
+          type:              r.type,
+          url:               directUrl,
+          downloadUrl:       directUrl,
+          directDownloadUrl: directUrl,
+          upstreamUrl:       r.downloadUrl,
+        };
+      }),
 
       // Summary counts
       summary: {
