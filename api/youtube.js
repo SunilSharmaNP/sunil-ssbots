@@ -29,9 +29,9 @@ function formatBytes(bytes) {
 
 const SAVENOW_API_KEY = "dfcb6d76f2f6a9894gjkege8a4ab232222";
 const SAVENOW_BASE = "https://p.savenow.to";
-const POLL_INTERVAL_MS = 1200; // poll every 1.2s
-const POLL_MAX_TRIES = 35; // max ~42s (ensures 1080p high bitrate conversion completes)
-const REQUEST_TIMEOUT = 14000; // 14s per HTTP call
+const POLL_INTERVAL_MS = 1500; // poll every 1.5s
+const POLL_MAX_TRIES = 60; // max ~90s (ensures long 1080p videos finish conversion without timing out)
+const REQUEST_TIMEOUT = 18000; // 18s per HTTP call
 
 const HEADERS = {
   "User-Agent":
@@ -43,10 +43,10 @@ const HEADERS = {
 
 /** Formats registry with real-world average bitrates (video + audio combined for mp4) */
 const FORMAT_MAP = {
-  "1080": { id: "1080", quality: "1080p", label: "MP4 1080p FHD (Video + Audio)", type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 4200000 },
-  "720":  { id: "720",  quality: "720p",  label: "MP4 720p HD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 2200000 },
-  "480":  { id: "480",  quality: "480p",  label: "MP4 480p SD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 1100000 },
-  "360":  { id: "360",  quality: "360p",  label: "MP4 360p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 600000 },
+  "1080": { id: "1080", quality: "1080p", label: "MP4 1080p FHD (Video + Audio)", type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 4650000 },
+  "720":  { id: "720",  quality: "720p",  label: "MP4 720p HD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 2950000 },
+  "480":  { id: "480",  quality: "480p",  label: "MP4 480p SD (Video + Audio)",   type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 1300000 },
+  "360":  { id: "360",  quality: "360p",  label: "MP4 360p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 700000 },
   "240":  { id: "240",  quality: "240p",  label: "MP4 240p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 350000 },
   "144":  { id: "144",  quality: "144p",  label: "MP4 144p Low (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 180000 },
   "1440": { id: "1440", quality: "1440p", label: "MP4 1440p 2K (Video + Audio)",  type: "video", hasAudio: true, hasVideo: true, defaultBitrate: 8000000 },
@@ -295,7 +295,7 @@ async function getYouTubeDetails(videoId) {
     }
   } catch {}
 
-  // Method 2: Extract REAL duration via YouTube search query (works for all videos without login/bot wall)
+  // Method 2: Extract REAL duration for this specific videoId
   try {
     const searchRes = await fetch(`https://www.youtube.com/results?search_query=${videoId}`, {
       headers: {
@@ -306,10 +306,31 @@ async function getYouTubeDetails(videoId) {
     });
     if (searchRes.ok) {
       const searchHtml = await searchRes.text();
-      // Match simpleText: "13:54" or "1:05:20"
-      const matchTimestamp = searchHtml.match(/"simpleText":\s*"(\d+:\d+(?::\d+)?)"/);
-      if (matchTimestamp && matchTimestamp[1]) {
-        const parts = matchTimestamp[1].split(":").map(Number);
+      // Locate the exact videoRenderer block for this videoId to avoid matching unrelated search ads
+      const targetStr = `"videoId":"${videoId}"`;
+      let pos = 0;
+      let matchedDurationText = null;
+
+      while ((pos = searchHtml.indexOf(targetStr, pos)) !== -1) {
+        const chunk = searchHtml.substring(pos, pos + 3500);
+        const m = chunk.match(/"lengthText":[\s\S]{1,160}?"simpleText":\s*"(\d+:\d+(?::\d+)?)"/);
+        if (m && m[1]) {
+          matchedDurationText = m[1];
+          break;
+        }
+        pos += targetStr.length;
+      }
+
+      // Fallback: if not found in chunk, try lengthText across document
+      if (!matchedDurationText) {
+        const mDoc = searchHtml.match(/"lengthText":[\s\S]{1,160}?"simpleText":\s*"(\d+:\d+(?::\d+)?)"/);
+        if (mDoc && mDoc[1]) {
+          matchedDurationText = mDoc[1];
+        }
+      }
+
+      if (matchedDurationText) {
+        const parts = matchedDurationText.split(":").map(Number);
         if (parts.length === 3) {
           durationSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
         } else if (parts.length === 2) {
@@ -403,6 +424,31 @@ function streamMediaDirectly(downloadUrl, title, fmtInfo, req, res, retryYtUrl =
     let targetUrl = downloadUrl;
     const clientRange = req.headers?.range;
 
+    const ext =
+      fmtInfo?.type === "audio" ? (fmtInfo.id === "m4a" ? "m4a" : "mp3") : "mp4";
+    const cleanTitle =
+      (title || "video").replace(/[^\w\s\-\.\u0900-\u097F]/gi, "").trim() ||
+      "download";
+    const filename = `${cleanTitle}.${ext}`;
+    const defaultContentType =
+      fmtInfo?.type === "audio" ? "audio/mpeg" : "video/mp4";
+
+    // Immediate HEAD response so download managers (aria2c, curl, telegram bots) immediately receive total size
+    if (req.method === "HEAD") {
+      res.status(200);
+      res.setHeader("Content-Type", defaultContentType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+      );
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Accept-Ranges", "bytes");
+      if (fmtInfo?.bytes) {
+        res.setHeader("Content-Length", String(fmtInfo.bytes));
+      }
+      return res.end();
+    }
+
     // Disable all socket and request timeouts for large downloads (1080p, 4k)
     if (req.setTimeout) req.setTimeout(0);
     if (res.setTimeout) res.setTimeout(0);
@@ -427,7 +473,7 @@ function streamMediaDirectly(downloadUrl, title, fmtInfo, req, res, retryYtUrl =
     const upstreamReq = transport.request(
       targetUrl,
       {
-        method: req.method === "HEAD" ? "HEAD" : "GET",
+        method: "GET",
         headers: requestHeaders,
         timeout: 0,
       },
@@ -497,14 +543,7 @@ function streamMediaDirectly(downloadUrl, title, fmtInfo, req, res, retryYtUrl =
           });
         }
 
-        const finalContentType =
-          contentType || (fmtInfo?.type === "audio" ? "audio/mpeg" : "video/mp4");
-        const ext =
-          fmtInfo?.type === "audio" ? (fmtInfo.id === "m4a" ? "m4a" : "mp3") : "mp4";
-        const cleanTitle =
-          (title || "video").replace(/[^\w\s\-\.\u0900-\u097F]/gi, "").trim() ||
-          "download";
-        const filename = `${cleanTitle}.${ext}`;
+        const finalContentType = contentType || defaultContentType;
 
         const statusCode = upstreamRes.statusCode || (clientRange ? 206 : 200);
         res.status(statusCode);
@@ -523,12 +562,11 @@ function streamMediaDirectly(downloadUrl, title, fmtInfo, req, res, retryYtUrl =
           res.setHeader("Content-Range", contentRange);
         }
 
-        // CRITICAL FIX: Only forward Content-Length if the upstream server explicitly provided it!
-        // DO NOT set an artificial/estimated Content-Length on chunked media streams.
-        // Forcing a mismatched Content-Length causes browsers to abort at 94%/95%.
+        // Set Content-Length so download clients (like aria2) know the exact total file size
         const exactUpstreamLength = upstreamRes.headers["content-length"];
-        if (exactUpstreamLength) {
-          res.setHeader("Content-Length", exactUpstreamLength);
+        const totalContentLength = exactUpstreamLength || fmtInfo?.bytes;
+        if (totalContentLength && !clientRange) {
+          res.setHeader("Content-Length", String(totalContentLength));
         }
 
         if (req.method === "HEAD") {
@@ -691,7 +729,17 @@ module.exports = async function handler(req, res) {
       const job = await processFormat(ytUrl, targetFmt, token, ytDetails.qualityBytes);
 
       if (job && job.status === "ready" && job.downloadUrl) {
-        return streamMediaDirectly(job.downloadUrl, ytDetails.title, targetFmt, req, res, ytUrl);
+        if (req.query?.redirect === "true" || req.query?.direct === "true") {
+          return res.redirect(302, job.downloadUrl);
+        }
+        return streamMediaDirectly(
+          job.downloadUrl,
+          ytDetails.title,
+          { ...targetFmt, bytes: job.bytes || ytDetails.qualityBytes[targetFmt.id] },
+          req,
+          res,
+          ytUrl
+        );
       } else {
         return sendJson(res, 502, {
           success: false,
@@ -766,8 +814,6 @@ module.exports = async function handler(req, res) {
           bytes:       r.bytes,
           downloadUrl: directProxyUrl,
           directUrl:   r.downloadUrl,
-          upstreamUrl: r.downloadUrl,
-          cdnUrl:      r.downloadUrl,
         };
       });
 
@@ -785,13 +831,11 @@ module.exports = async function handler(req, res) {
           bytes:       r.bytes,
           downloadUrl: directProxyUrl,
           directUrl:   r.downloadUrl,
-          upstreamUrl: r.downloadUrl,
-          cdnUrl:      r.downloadUrl,
         };
       });
 
-    // Clean unified list (only contains unique entries)
-    const downloads = [...videos, ...audios];
+    // Clean unified list of unique formats (NO DUPLICATION)
+    const formats = [...videos, ...audios];
 
     return sendJson(res, 200, {
       success:         available.length > 0,
@@ -808,15 +852,13 @@ module.exports = async function handler(req, res) {
       // Primary Direct Download Link
       downloadUrl:     primaryDirectUrl,
       directUrl:       primary ? primary.downloadUrl : null,
-      cdnUrl:          primary ? primary.downloadUrl : null,
       size:            primary?.size,
       bytes:           primary?.bytes,
 
       // Clean Categorized Lists (NO DUPLICATION)
       videos,
       audios,
-      downloads,
-      formats: downloads, // alias for backwards compatibility
+      formats,
 
       summary: {
         total:       targetFormats.length,
