@@ -729,7 +729,10 @@ module.exports = async function handler(req, res) {
       const job = await processFormat(ytUrl, targetFmt, token, ytDetails.qualityBytes);
 
       if (job && job.status === "ready" && job.downloadUrl) {
-        if (req.query?.redirect === "true" || req.query?.direct === "true") {
+        // In serverless / Vercel environments, proxy-streaming large files (500MB+) hits the 60s hard timeout
+        // causing video cutoff (10:43 or 13:06 instead of 15:04).
+        // Redirecting (302) hands the download off directly to the high-speed CDN, guaranteeing 100% full length!
+        if (req.query?.proxy !== "true") {
           return res.redirect(302, job.downloadUrl);
         }
         return streamMediaDirectly(
